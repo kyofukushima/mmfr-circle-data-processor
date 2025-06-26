@@ -607,6 +607,10 @@ def main():
     # サイドバーにデバッグモードの切り替えを追加
     with st.sidebar:
         st.session_state.debug_mode = st.checkbox("デバッグモード", value=st.session_state.debug_mode)
+        
+        # バージョン情報（控えめに表示）
+        st.markdown("")
+        st.caption("v1.0 - 2025/06/26")
     
     st.title("育児サークル情報処理アプリ")
     
