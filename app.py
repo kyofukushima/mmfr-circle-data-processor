@@ -681,6 +681,10 @@ def main():
     
     if all_data_ready:
         st.success("全てのファイルが正常に読み込まれました。処理を開始できます。")
+        
+        # 自治体名の入力フィールドを追加（デフォルト値：北九州市様）
+        municipality = st.text_input("自治体名", value="北九州市様", help="ダウンロードファイル名に使用される自治体名を入力してください")
+        
         if st.button("処理開始"):
             try:
                 # ファイル処理を実行
@@ -699,11 +703,18 @@ def main():
                     st.info(f"CSVファイルの列数: {len(circle_data.columns)}列")
                     st.info(f"テンプレートファイルの列数: {template_ws.max_column}列")
                 
+                # 現在の月を取得
+                from datetime import datetime
+                current_month = datetime.now().month
+                
+                # ファイル名を生成
+                file_name = f"【{municipality}】育児サークル等修正用データ（{current_month}月分）.xlsx"
+                
                 # ダウンロードボタンを表示
                 st.download_button(
                     label="処理済みファイルをダウンロード",
                     data=output,
-                    file_name="processed_template.xlsx",
+                    file_name=file_name,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
                 
