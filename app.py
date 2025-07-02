@@ -4,13 +4,32 @@ import io
 import time
 import os
 import chardet
+import re
+import datetime
+import hashlib
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
-from copy import copy
 from openpyxl.styles import Border, Side, Alignment, Font
+from copy import copy
 
 # テンプレートファイルのパスを環境変数から取得（テスト時に切り替え可能）
 TEMPLATE_FILE = os.getenv('TEMPLATE_FILE', 'template.xlsx')
+
+def normalize_value(raw_value):
+    """欠損値を統一的に処理する共通関数
+    
+    Args:
+        raw_value: 処理対象の値
+    
+    Returns:
+        str: 正規化された値（空文字列または文字列）
+    """
+    if pd.isna(raw_value):
+        return ''
+    value = str(raw_value).strip()
+    if value in ['nan', 'None', '<NA>']:
+        return ''
+    return value
 
 def detect_encoding(file_content):
     """ファイルのエンコーディングを検出する"""
@@ -566,6 +585,207 @@ def initialize_session_state():
     """セッション状態の初期化"""
     if 'debug_mode' not in st.session_state:
         st.session_state.debug_mode = False
+    
+    # インポートデータ作成用のセッション状態
+    if 'validation_completed' not in st.session_state:
+        st.session_state.validation_completed = False
+    if 'validated_data' not in st.session_state:
+        st.session_state.validated_data = None
+    if 'import_data_created' not in st.session_state:
+        st.session_state.import_data_created = False
+    if 'import_files' not in st.session_state:
+        st.session_state.import_files = None
+    if 'formatted_data' not in st.session_state:
+        st.session_state.formatted_data = None
+    
+    # セッション状態の変化を追跡するためのログ
+    if 'session_log' not in st.session_state:
+        st.session_state.session_log = []
+    
+    # アップロードされたファイルの追跡用
+    if 'uploaded_files_hash' not in st.session_state:
+        st.session_state.uploaded_files_hash = {
+            'excel': None,
+            'facility': None,
+            'user': None
+        }
+
+def log_session_state_change(action, details=None):
+    """セッション状態の変化をログに記録"""
+    import datetime
+    
+    if 'session_log' not in st.session_state:
+        st.session_state.session_log = []
+    
+    log_entry = {
+        'timestamp': datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3],
+        'action': action,
+        'details': details or {},
+        'session_state': {
+            'validation_completed': st.session_state.get('validation_completed', False),
+            'validated_data': st.session_state.get('validated_data') is not None,
+            'import_data_created': st.session_state.get('import_data_created', False),
+            'import_files': st.session_state.get('import_files') is not None,
+            'formatted_data': st.session_state.get('formatted_data') is not None,
+        }
+    }
+    
+    st.session_state.session_log.append(log_entry)
+    
+    # ログの最大数を制限（メモリ使用量を抑制）
+    if len(st.session_state.session_log) > 50:
+        st.session_state.session_log = st.session_state.session_log[-50:]
+
+def show_session_state_debug():
+    """セッション状態のデバッグ情報を表示"""
+    if not st.session_state.get('debug_mode', False):
+        return
+    
+    with st.expander("🔍 セッション状態デバッグ情報", expanded=False):
+        # 現在のセッション状態
+        st.subheader("現在のセッション状態")
+        current_state = {
+            'validation_completed': st.session_state.get('validation_completed', False),
+            'validated_data': st.session_state.get('validated_data') is not None,
+            'import_data_created': st.session_state.get('import_data_created', False),
+            'import_files': st.session_state.get('import_files') is not None,
+            'formatted_data': st.session_state.get('formatted_data') is not None,
+        }
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            for key, value in current_state.items():
+                status_icon = "✅" if value else "❌"
+                st.write(f"{status_icon} {key}: {value}")
+        
+        with col2:
+            if st.session_state.get('validated_data') is not None:
+                st.write(f"📊 validated_data 行数: {len(st.session_state.validated_data)}")
+            if st.session_state.get('import_files') is not None:
+                st.write(f"📁 import_files 数: {len(st.session_state.import_files)}")
+            if st.session_state.get('formatted_data') is not None:
+                st.write(f"📋 formatted_data 行数: {len(st.session_state.formatted_data)}")
+        
+        # セッション状態の変化ログ
+        if st.session_state.get('session_log'):
+            st.subheader("セッション状態変化ログ")
+            
+            # ログをテーブル形式で表示
+            log_data = []
+            for log_entry in reversed(st.session_state.session_log[-10:]):  # 最新10件
+                log_data.append({
+                    '時刻': log_entry['timestamp'],
+                    'アクション': log_entry['action'],
+                    '検証完了': "✅" if log_entry['session_state']['validation_completed'] else "❌",
+                    'データ作成完了': "✅" if log_entry['session_state']['import_data_created'] else "❌",
+                    'ファイル存在': "✅" if log_entry['session_state']['import_files'] else "❌",
+                    '詳細': str(log_entry['details']) if log_entry['details'] else ""
+                })
+            
+            if log_data:
+                st.dataframe(pd.DataFrame(log_data), use_container_width=True)
+            
+            # ログクリアボタン
+            if st.button("ログをクリア", key="clear_session_log"):
+                st.session_state.session_log = []
+                # st.rerun()は削除 - セッションリセットを防ぐため、次回の自動リロードで反映される
+        
+        # ユーザーCSV作成デバッグ情報
+        if hasattr(st.session_state, 'user_csv_debug_info') and st.session_state.user_csv_debug_info:
+            st.subheader("ユーザー新規追加CSV作成デバッグ情報")
+            debug_info = st.session_state.user_csv_debug_info
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"📅 対象月コード: {debug_info['target_month_code']}")
+                st.write(f"📊 全データ行数: {debug_info['total_rows']}")
+                st.write(f"✅ アカウント発行有無が○の行数: {debug_info['account_issued_count']}")
+            
+            with col2:
+                st.write(f"📆 アカウント発行年月が対象月と一致: {debug_info['month_match_count']}")
+                st.write(f"🎯 両方の条件を満たす行数: {debug_info['new_accounts_count']}")
+            
+            # サンプルデータまたは原因調査の表示
+            if debug_info['new_accounts_count'] > 0:
+                st.write("✅ **条件を満たすデータのサンプル:**")
+                if debug_info['new_accounts_sample'] is not None:
+                    st.dataframe(debug_info['new_accounts_sample'], use_container_width=True)
+            else:
+                st.write("❌ **条件を満たさない理由の調査:**")
+                
+                if debug_info['account_values'] is not None:
+                    st.write("**アカウント発行有無列の値の分布:**")
+                    st.write(debug_info['account_values'])
+                
+                if debug_info['month_values'] is not None:
+                    st.write("**アカウント発行年月列の値の分布（変換後）:**")
+                    st.write(debug_info['month_values'])
+            
+            # アカウント発行年月の変換詳細を表示
+            if 'conversion_details' in debug_info and debug_info['conversion_details'] is not None:
+                st.write("**📅 アカウント発行年月の変換詳細:**")
+                st.dataframe(debug_info['conversion_details'], use_container_width=True)
+            
+            # デバッグ情報クリアボタン
+            if st.button("ユーザーCSVデバッグ情報をクリア", key="clear_user_csv_debug"):
+                del st.session_state.user_csv_debug_info
+                # st.rerun()は削除 - セッションリセットを防ぐため、次回の自動リロードで反映される
+
+def reset_import_session_state():
+    """インポートデータ作成関連のセッション状態をリセット"""
+    log_session_state_change("reset_import_session_state", {
+        'before_validation_completed': st.session_state.get('validation_completed', False),
+        'before_import_data_created': st.session_state.get('import_data_created', False)
+    })
+    
+    st.session_state.validation_completed = False
+    st.session_state.validated_data = None
+    st.session_state.import_data_created = False
+    st.session_state.import_files = None
+    st.session_state.formatted_data = None
+    st.session_state.balloons_shown = False  # バルーン表示フラグもリセット
+    
+    # 警告メッセージもクリア
+    if 'account_date_warning' in st.session_state:
+        del st.session_state.account_date_warning
+
+def check_file_changed(file, file_type):
+    """ファイルが変更されたかチェックし、変更された場合のみセッション状態をリセット
+    
+    Args:
+        file: アップロードされたファイル
+        file_type: ファイルタイプ ('excel', 'facility', 'user')
+    
+    Returns:
+        bool: ファイルが変更された場合True
+    """
+    if file is None:
+        return False
+    
+    # ファイルの内容からハッシュを生成
+    file_content = file.read()
+    file.seek(0)  # ファイルポインタを先頭に戻す
+    file_hash = hashlib.md5(file_content).hexdigest()
+    
+    # 前回のハッシュと比較
+    previous_hash = st.session_state.uploaded_files_hash.get(file_type)
+    
+    if previous_hash != file_hash:
+        # ファイルが変更された場合
+        st.session_state.uploaded_files_hash[file_type] = file_hash
+        log_session_state_change(f"{file_type}_file_changed", {
+            'filename': file.name,
+            'previous_hash': previous_hash,
+            'new_hash': file_hash
+        })
+        return True
+    else:
+        # ファイルが変更されていない場合
+        log_session_state_change(f"{file_type}_file_unchanged", {
+            'filename': file.name,
+            'hash': file_hash
+        })
+        return False
 
 def validate_order_column(df):
     """順番列の値を検証する
@@ -601,18 +821,9 @@ def validate_order_column(df):
         
         st.warning("\n".join(warning_message))
 
-def main():
-    initialize_session_state()
-    
-    # サイドバーにデバッグモードの切り替えを追加
-    with st.sidebar:
-        st.session_state.debug_mode = st.checkbox("デバッグモード", value=st.session_state.debug_mode)
-        
-        # バージョン情報（控えめに表示）
-        st.markdown("")
-        st.caption("v1.0 - 2025/06/26")
-    
-    st.title("育児サークル情報処理アプリ")
+def show_modification_excel_page():
+    """データ修正用エクセル作成ページの表示"""
+    st.header("データ修正用エクセル作成")
     
     # デバッグモード時のみ表示される情報
     if st.session_state.debug_mode:
@@ -704,8 +915,7 @@ def main():
                     st.info(f"テンプレートファイルの列数: {template_ws.max_column}列")
                 
                 # 現在の月を取得
-                from datetime import datetime
-                current_month = datetime.now().month
+                current_month = datetime.datetime.now().month
                 
                 # ファイル名を生成
                 file_name = f"【{municipality}】育児サークル等修正用データ（{current_month}月分）.xlsx"
@@ -724,11 +934,1610 @@ def main():
                 st.error(str(e))
             except Exception as e:
                 st.error(f"予期せぬエラーが発生しました: {str(e)}")
+
+def validate_modification_status(main_data, original_data):
+    """修正・削除新規ステータスの検証
     
-    st.write("### 使い方")
-    st.write("1. CSVファイルをアップロードしてください")
-    st.write("2. 「処理開始」ボタンをクリックしてください")
-    st.write("3. 処理が完了したら、「処理済みファイルをダウンロード」ボタンが表示されます")
+    Args:
+        main_data (pd.DataFrame): メインデータ
+        original_data (pd.DataFrame): 差分検出用データ
+    
+    Returns:
+        pd.DataFrame: エラー情報を含むデータフレーム
+    """
+    errors = []
+    valid_statuses = ['修正', '新規追加', '掲載順', '削除']
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        status = normalize_value(row.get('修正・削除新規', ''))
+        
+        # ステータス値の検証
+        if status != '' and status not in valid_statuses:
+            error_list.append(f"修正・削除新規列に、次の値以外が入力されています。(修正・新規追加・掲載順・削除)")
+        
+        # 修正ステータスの検証
+        if status == '修正':
+            slug = str(row.get('スラッグ', '')).strip()
+            if slug:
+                # 差分検出用データから同じスラッグの行を取得
+                original_row = original_data[original_data['スラッグ'] == slug]
+                if not original_row.empty:
+                    # 修正・削除新規列以外の列で差分をチェック
+                    check_columns = [col for col in main_data.columns if col != '修正・削除新規']
+                    has_difference = False
+                    
+                    for col in check_columns:
+                        if col in original_row.columns:
+                            main_value = normalize_value(row.get(col, ''))
+                            original_value = normalize_value(original_row.iloc[0].get(col, ''))
+                            
+                            if main_value != original_value:
+                                has_difference = True
+                                break
+                    
+                    if not has_difference:
+                        error_list.append("修正にもかかわらず、値が変更されていません")
+        
+        # 新規追加ステータスの検証
+        elif status == '新規追加':
+            slug = normalize_value(row.get('スラッグ', ''))
+            if slug != '':
+                error_list.append("新規追加にもかかわらずスラッグ列に値が入力されています")
+        
+        # 掲載順ステータスの検証
+        elif status == '掲載順':
+            slug = str(row.get('スラッグ', '')).strip()
+            if slug:
+                original_row = original_data[original_data['スラッグ'] == slug]
+                if not original_row.empty:
+                    main_order = normalize_value(row.get('順番', ''))
+                    original_order = normalize_value(original_row.iloc[0].get('順番', ''))
+                    
+                    if main_order == original_order:
+                        error_list.append("「掲載順」ステータスが振られていますが、順番が変わっていません")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+def validate_empty_status(main_data, original_data):
+    """空欄の検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+        original_data (pd.DataFrame): 差分検出用データ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        status = normalize_value(row.get('修正・削除新規', ''))
+        
+        if status == '':  # 空欄または欠損値の場合
+            slug = str(row.get('スラッグ', '')).strip()
+            if slug:
+                original_row = original_data[original_data['スラッグ'] == slug]
+                if not original_row.empty:
+                    # 修正・削除新規列以外の列で差分をチェック
+                    check_columns = [col for col in main_data.columns if col != '修正・削除新規']
+                    changed_columns = []
+                    
+                    for col in check_columns:
+                        if col in original_row.columns:
+                            main_value = normalize_value(row.get(col, ''))
+                            original_value = normalize_value(original_row.iloc[0].get(col, ''))
+                            
+                            if main_value != original_value:
+                                changed_columns.append(col)
+                    
+                    if changed_columns:
+                        error_list.append(f"修正と書かれていませんが、{','.join(changed_columns)}の値が変更されています")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+def validate_machine_dependent_characters(main_data):
+    """機種依存文字の検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    target_columns = ['サークル名', '概要', '活動場所', '申込方法', '会費', '活動日_備考', 
+                     '団体名（ふりがな）', '小学校区', '小学校区（ふりがな）', '代表者名', 
+                     '代表者名（ふりがな）', '代表者住所', '記入者', '場所']
+    
+    # 機種依存文字のパターン（一部の例）
+    machine_dependent_chars = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩', 
+                              '㍉', '㌔', '㌘', '㌧', '㌃', '㌍', '㌦', '㌢', '㌘', '㌧']
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        
+        for col in target_columns:
+            if col in main_data.columns:
+                value = normalize_value(row.get(col, ''))
+                
+                if value:  # 空欄でない場合のみチェック
+                    for char in machine_dependent_chars:
+                        if char in value:
+                            error_list.append(f"{col}列に機種依存文字が含まれています")
+                            break
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+def validate_cell_line_breaks(main_data):
+    """セル内改行の検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    target_columns = ['サークル名', '活動種別', '活動場所', '申込方法', 'Eメールアドレス', '会費', 
+                     'Webサイト', '活動日_備考', '団体名（ふりがな）', '幼稚園・保育園チェック', 
+                     '小学校区', '小学校区（ふりがな）', '代表者名', '代表者名（ふりがな）', 
+                     '代表者住所', '記入者', '場所']
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        
+        for col in target_columns:
+            if col in main_data.columns:
+                value = normalize_value(row.get(col, ''))
+                
+                if value and ('\n' in value or '\r' in value):
+                    error_list.append(f"{col}列にセル内改行が含まれています")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+def validate_prohibited_changes(main_data, original_data):
+    """変更禁止列の検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+        original_data (pd.DataFrame): 差分検出用データ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    prohibited_columns = ['スラッグ', 'ステータス', '参加者の条件(妊娠後半)', '参加者の条件(出産)', 
+                         '参加者の条件(1歳後半)', '参加者の条件(2歳後半)', '申込方法備考', 
+                         '活動日_営業時間ラベル', '代表者', '団体名']
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        status = normalize_value(row.get('修正・削除新規', ''))
+        
+        # 新規追加の場合はスキップ
+        if status == '新規追加':
+            errors.append('')
+            continue
+        
+        slug = str(row.get('スラッグ', '')).strip()
+        if slug:
+            original_row = original_data[original_data['スラッグ'] == slug]
+            if not original_row.empty:
+                changed_columns = []
+                
+                for col in prohibited_columns:
+                    if col in main_data.columns and col in original_row.columns:
+                        main_value = normalize_value(row.get(col, ''))
+                        original_value = normalize_value(original_row.iloc[0].get(col, ''))
+                        
+                        if main_value != original_value:
+                            changed_columns.append(col)
+                
+                if changed_columns:
+                    error_list.append(f"{','.join(changed_columns)}の値が変更されています")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+def validate_consecutive_spaces(main_data):
+    """連続した空白の検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    target_columns = ['サークル名', '概要', '活動場所', '申込方法', '会費', '活動日_備考', 
+                     '団体名（ふりがな）', '小学校区', '小学校区（ふりがな）', '代表者名', 
+                     '代表者名（ふりがな）', '代表者住所', '記入者', '場所']
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        
+        for col in target_columns:
+            if col in main_data.columns:
+                value = normalize_value(row.get(col, ''))
+                
+                if value and '   ' in value:  # 3つ以上の連続した空白
+                    error_list.append(f"{col}列に連続した空白が含まれています")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+def validate_alphanumeric(main_data):
+    """半角英数の検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    # Webサイト列を除外（URL検証で別途処理）
+    target_columns = ['申込先電話番号', '代表者郵便番号', '代表者電話番号', 
+                     '代表者FAX', '代表者携帯番号', '順番']
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        
+        for col in target_columns:
+            if col in main_data.columns:
+                value = normalize_value(row.get(col, ''))
+                
+                if value:  # 空欄でない場合のみチェック
+                    # 半角英数字、各種ハイフン、ピリオド、スラッシュ、コロンのみ許可
+                    if not re.match(r'^[a-zA-Z0-9\-‐–—−\.\/:]*$', value):
+                        error_list.append(f"{col}列に半角英数字以外の文字が含まれています")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+def validate_email_addresses(main_data):
+    """メールアドレスの検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    target_columns = ['Eメールアドレス', 'アカウント発行の登録用メールアドレス']
+    
+    email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        
+        for col in target_columns:
+            if col in main_data.columns:
+                value = normalize_value(row.get(col, ''))
+                
+                if value and not email_pattern.match(value):
+                    error_list.append(f"{col}列のメールアドレスが無効です")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+def validate_required_fields(main_data):
+    """必須項目の検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    required_columns = ['サークル名', 'スラッグ', 'ステータス', '活動種別']
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        status = normalize_value(row.get('修正・削除新規', ''))
+        
+        # 新規追加の場合はスキップ
+        if status == '新規追加':
+            errors.append('')
+            continue
+        
+        for col in required_columns:
+            if col in main_data.columns:
+                value = normalize_value(row.get(col, ''))
+                
+                if not value:
+                    error_list.append(f"{col}列が空欄です")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+def validate_circle_or_cross(main_data):
+    """マルバツの検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    target_columns = ['参加者の条件(妊娠)', '参加者の条件(妊娠後半)', '参加者の条件(0歳)', 
+                     '参加者の条件(1歳)', '参加者の条件(1歳後半)', '参加者の条件(2歳)', 
+                     '参加者の条件(2歳後半)', '参加者の条件(3歳)', '参加者の条件(4歳)', 
+                     '参加者の条件(5歳)', '参加者の条件(6歳)', '参加者の条件(どなたでも)', 
+                     '要会費', '冊子掲載可', 'HP掲載可', 'オープンデータ掲載可']
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        
+        for col in target_columns:
+            if col in main_data.columns:
+                value = normalize_value(row.get(col, ''))
+                
+                if value and value not in ['○', '']:
+                    error_list.append(f"{col}列に○または空欄以外の値が入力されています")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+async def validate_website_urls(main_data):
+    """webサイトURL検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    from validate import is_url_alive
+    import aiohttp
+    
+    errors = []
+    target_column = 'Webサイト'
+    
+    if target_column not in main_data.columns:
+        return [''] * len(main_data)
+    
+    # 空でないURLのみを抽出
+    urls_to_check = []
+    for idx, row in main_data.iterrows():
+        raw_value = row.get(target_column, '')
+        # 空欄と欠損値を同じものとして扱う
+        if pd.isna(raw_value):
+            value = ''
+        else:
+            value = str(raw_value).strip()
+            if value == 'nan' or value == 'None' or value == '<NA>':
+                value = ''
+        
+        if value:  # 空欄でない場合のみチェック
+            # @で始まる場合は@を除去
+            if value.startswith('@'):
+                value = value[1:]
+            urls_to_check.append((idx, value))
+        else:
+            errors.append('')
+    
+    if not urls_to_check:
+        return errors
+    
+    # 非同期でURL検証を実行
+    async with aiohttp.ClientSession() as session:
+        for idx, url in urls_to_check:
+            try:
+                _, error_msg = await is_url_alive(url, target_column, session)
+                if idx >= len(errors):
+                    errors.extend([''] * (idx - len(errors) + 1))
+                errors[idx] = error_msg
+            except Exception as e:
+                if idx >= len(errors):
+                    errors.extend([''] * (idx - len(errors) + 1))
+                errors[idx] = f"{target_column}列でURL検証エラー: {str(e)}"
+    
+    # 不足分を空文字で埋める
+    while len(errors) < len(main_data):
+        errors.append('')
+    
+    return errors
+
+def validate_facility_location(main_data, facility_data):
+    """活動場所の検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+        facility_data (pd.DataFrame): 施設情報データ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    
+    if facility_data is None or '施設名' not in facility_data.columns:
+        # 施設情報がない場合はスキップ
+        return [''] * len(main_data)
+    
+    facility_names = set(facility_data['施設名'].astype(str).str.strip())
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        
+        if '活動場所' in main_data.columns:
+            raw_value = row.get('活動場所', '')
+            # 空欄と欠損値を同じものとして扱う
+            if pd.isna(raw_value):
+                value = ''
+            else:
+                value = str(raw_value).strip()
+                if value == 'nan' or value == 'None' or value == '<NA>':
+                    value = ''
+            
+            # 空欄でない場合のみチェック
+            if value and value not in facility_names:
+                error_list.append("活動場所が施設情報に存在しません")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+def validate_status_column(main_data):
+    """ステータス列の検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    valid_statuses = ['publish', 'private', '']
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        
+        if 'ステータス' in main_data.columns:
+            raw_value = row.get('ステータス', '')
+            # 空欄と欠損値を同じものとして扱う
+            if pd.isna(raw_value):
+                value = ''
+            else:
+                value = str(raw_value).strip()
+                if value == 'nan' or value == 'None' or value == '<NA>':
+                    value = ''
+            
+            if value not in valid_statuses:
+                error_list.append("ステータス列に無効な値が入力されています")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+def validate_account_issue_date(main_data):
+    """アカウント発行年月の検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    
+    # 和暦から西暦への変換関数（検証用）
+    def convert_wareki_to_seireki_for_validation(wareki_str):
+        if pd.isna(wareki_str):
+            return None
+        
+        # 文字列に変換して正規化
+        wareki_str = str(wareki_str).strip()
+        if not wareki_str or wareki_str in ['nan', 'None', '<NA>']:
+            return None
+            
+        try:
+            # カンマまたはピリオドで分割
+            separator = ',' if ',' in wareki_str else '.' if '.' in wareki_str else None
+            if separator:
+                parts = wareki_str.split(separator)
+                if len(parts) == 2:
+                    year_part = parts[0].strip()
+                    month_part = int(parts[1].strip())
+                    
+                    # 月の範囲チェック
+                    if not (1 <= month_part <= 12):
+                        return False  # 無効な月
+                    
+                    if year_part.startswith('R'):
+                        # 令和
+                        reiwa_year = int(year_part[1:])
+                        # 令和年の妥当性チェック（令和1年〜令和50年程度まで）
+                        if not (1 <= reiwa_year <= 50):
+                            return False  # 無効な令和年
+                        seireki_year = 2018 + reiwa_year
+                        return seireki_year * 100 + month_part
+            return False  # 変換できない形式
+        except:
+            return False  # 変換エラー
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        
+        if 'ｱｶｳﾝﾄ発行年月' in main_data.columns:
+            value = normalize_value(row.get('ｱｶｳﾝﾄ発行年月', ''))
+            
+            # 空欄でない場合のみ検証
+            if value:
+                conversion_result = convert_wareki_to_seireki_for_validation(value)
+                if conversion_result is False:
+                    error_list.append("ｱｶｳﾝﾄ発行年月列に変換できない値が入力されています")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+def perform_data_validation(main_data, original_data, facility_data=None, validation_options=None):
+    """データ検証の実行
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+        original_data (pd.DataFrame): 差分検出用データ
+        facility_data (pd.DataFrame, optional): 施設情報データ
+        validation_options (dict, optional): 実行する検証項目の選択
+    
+    Returns:
+        pd.DataFrame: エラー情報を含むメインデータ
+    """
+    # エラー列を初期化
+    main_data_with_errors = main_data.copy()
+    
+    # デフォルトでは全ての検証を実行
+    if validation_options is None:
+        validation_options = {
+            'modification_status': True,
+            'empty_status': True,
+            'machine_dependent': True,
+            'cell_breaks': True,
+            'prohibited_changes': True,
+            'consecutive_spaces': True,
+            'alphanumeric': True,
+            'email': True,
+            'required_fields': True,
+            'circle_cross': True,
+            'facility_location': True,
+            'status_column': True,
+            'website_urls': True,
+            'account_issue_date': True
+        }
+    
+    # 各検証を実行
+    validation_functions = [
+        ('modification_status', '修正・削除新規ステータス', lambda: validate_modification_status(main_data, original_data)),
+        ('empty_status', '空欄ステータス', lambda: validate_empty_status(main_data, original_data)),
+        ('machine_dependent', '機種依存文字', lambda: validate_machine_dependent_characters(main_data)),
+        ('cell_breaks', 'セル内改行', lambda: validate_cell_line_breaks(main_data)),
+        ('prohibited_changes', '変更禁止列', lambda: validate_prohibited_changes(main_data, original_data)),
+        ('consecutive_spaces', '連続した空白', lambda: validate_consecutive_spaces(main_data)),
+        ('alphanumeric', '半角英数', lambda: validate_alphanumeric(main_data)),
+        ('email', 'メールアドレス', lambda: validate_email_addresses(main_data)),
+        ('required_fields', '必須項目', lambda: validate_required_fields(main_data)),
+        ('circle_cross', 'マルバツ', lambda: validate_circle_or_cross(main_data)),
+        ('facility_location', '活動場所', lambda: validate_facility_location(main_data, facility_data)),
+        ('status_column', 'ステータス', lambda: validate_status_column(main_data)),
+        ('account_issue_date', 'アカウント発行年月', lambda: validate_account_issue_date(main_data))
+    ]
+    
+    # 非同期検証（webサイトURL検証）
+    async_validation_functions = [
+        ('website_urls', 'webサイトURL', lambda: validate_website_urls(main_data))
+    ]
+    
+    all_errors = []
+    executed_validations = []
+    
+    # 同期検証を実行
+    for validation_key, validation_name, validation_func in validation_functions:
+        if validation_options.get(validation_key, False):
+            try:
+                errors = validation_func()
+                all_errors.append(errors)
+                executed_validations.append(validation_name)
+            except Exception as e:
+                st.error(f"{validation_name}の検証中にエラーが発生しました: {str(e)}")
+                all_errors.append([''] * len(main_data))
+                executed_validations.append(f"{validation_name}（エラー）")
+    
+    # 非同期検証を実行
+    import asyncio
+    for validation_key, validation_name, validation_func in async_validation_functions:
+        if validation_options.get(validation_key, False):
+            try:
+                errors = asyncio.run(validation_func())
+                all_errors.append(errors)
+                executed_validations.append(validation_name)
+            except Exception as e:
+                st.error(f"{validation_name}の検証中にエラーが発生しました: {str(e)}")
+                all_errors.append([''] * len(main_data))
+                executed_validations.append(f"{validation_name}（エラー）")
+    
+    # 実行された検証項目を表示
+    if executed_validations:
+        st.info(f"実行された検証項目: {', '.join(executed_validations)}")
+    else:
+        st.warning("検証項目が選択されていません。")
+        main_data_with_errors['エラー'] = [''] * len(main_data)
+        return main_data_with_errors
+    
+    # 全てのエラーを統合
+    combined_errors = []
+    for i in range(len(main_data)):
+        row_errors = []
+        for error_list in all_errors:
+            if i < len(error_list) and error_list[i]:
+                row_errors.append(error_list[i])
+        combined_errors.append(', '.join(row_errors))
+    
+    main_data_with_errors['エラー'] = combined_errors
+    
+    return main_data_with_errors
+
+def validate_import_excel_file(excel_file, skip_rows_count=2):
+    """インポート用Excelファイルの検証と読み込みを行う
+    
+    Args:
+        excel_file: アップロードされたExcelファイル
+        skip_rows_count: スキップする行数
+    
+    Returns:
+        tuple: (メインデータ, 差分検出用データ)
+    """
+    try:
+        # Excelファイルを読み込んでシート情報を取得
+        wb = pd.ExcelFile(excel_file)
+        sheet_names = wb.sheet_names
+        
+        # シート数の検証
+        if len(sheet_names) > 2:
+            raise ValueError("シート数が2より多いため、どのシートをメインデータにするかが特定できません")
+        
+        if len(sheet_names) < 2:
+            raise ValueError("originalシートと別のシートが必要ですが、シート数が不足しています")
+        
+        # originalシートと別シートを特定
+        original_sheet = None
+        main_sheet = None
+        
+        for sheet_name in sheet_names:
+            if sheet_name.lower() == 'original':
+                original_sheet = sheet_name
+            else:
+                main_sheet = sheet_name
+        
+        if original_sheet is None:
+            raise ValueError("'original'という名前のシートが見つかりません")
+        
+        # メインデータを読み込み（指定された行数をスキップ）
+        main_data = pd.read_excel(excel_file, sheet_name=main_sheet, skiprows=list(range(1, skip_rows_count + 1)))
+        
+        # 差分検出用データを読み込み（指定された行数をスキップ）
+        original_data = pd.read_excel(excel_file, sheet_name=original_sheet, skiprows=list(range(1, skip_rows_count + 1)))
+        
+        # 基本的な検証
+        if main_data.empty:
+            raise ValueError("メインデータが空です")
+        if original_data.empty:
+            raise ValueError("差分検出用データが空です")
+            
+        if len(main_data.columns) == 0:
+            raise ValueError("メインデータに列が存在しません")
+        if len(original_data.columns) == 0:
+            raise ValueError("差分検出用データに列が存在しません")
+        
+        return main_data, original_data
+        
+    except Exception as e:
+        raise ValueError(f"Excelファイルの読み込み中にエラーが発生しました: {str(e)}")
+
+def show_import_data_page():
+    """インポートデータ作成ページの表示"""
+    log_session_state_change("page_loaded", {'page': 'import_data'})
+    
+    st.header("インポートデータ作成")
+    
+    # セッション状態のデバッグ情報を表示
+    show_session_state_debug()
+    
+    # デバッグモード時のみ表示される情報
+    if st.session_state.debug_mode:
+        st.write("### デバッグ情報")
+        st.write("デバッグモードが有効です")
+    
+    st.write("### ファイルのアップロード")
+    
+    # 修正済みExcelファイルのアップロード
+    excel_file = st.file_uploader("修正済みExcelファイルを選択してください", type=['xlsx'], key="import_excel")
+    
+    # スキップする行数の指定
+    skip_rows = st.number_input("スキップする行数", min_value=0, max_value=10, value=2, 
+                               help="ヘッダー以外の上から何行をスキップするかを指定してください")
+    
+    main_data = None
+    original_data = None
+    
+    if excel_file:
+        try:
+            # ファイルが変更された場合のみセッション状態をリセット
+            if check_file_changed(excel_file, 'excel'):
+                reset_import_session_state()
+            
+            # Excelファイルの検証と読み込み
+            main_data, original_data = validate_import_excel_file(excel_file, skip_rows)
+            
+            st.success("Excelファイルが正常に読み込まれました")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                with st.expander("メインデータを確認する"):
+                    st.dataframe(main_data, use_container_width=True)
+                    st.info(f"行数: {len(main_data)}, 列数: {len(main_data.columns)}")
+            
+            with col2:
+                with st.expander("差分検出用データを確認する"):
+                    st.dataframe(original_data, use_container_width=True)
+                    st.info(f"行数: {len(original_data)}, 列数: {len(original_data.columns)}")
+                    
+        except ValueError as e:
+            st.error(f"Excelファイルのエラー: {str(e)}")
+        except Exception as e:
+            st.error(f"Excelファイルの予期せぬエラー: {str(e)}")
+    
+    # 施設情報CSVファイルのアップロード（データ検証用）
+    facility_csv_file = st.file_uploader("施設情報CSVファイルを選択してください", type=['csv'], key="import_facility")
+    facility_data = None
+    
+    if facility_csv_file:
+        try:
+            # ファイルが変更された場合のみセッション状態をリセット
+            if check_file_changed(facility_csv_file, 'facility'):
+                reset_import_session_state()
+            
+            # 施設情報CSVファイルの検証と読み込み
+            facility_data, facility_encoding, facility_debug_info = validate_csv_file(facility_csv_file)
+            
+            st.success(f"施設情報CSVファイルが正常に読み込まれました（エンコーディング: {facility_encoding}）")
+            with st.expander("施設情報データを確認する"):
+                st.dataframe(facility_data, use_container_width=True)
+                
+            # デバッグモード時に詳細情報を表示
+            if st.session_state.get('debug_mode', False):
+                with st.expander("🔍 施設情報CSV読み込み詳細"):
+                    st.write("**エンコーディング検出ログ:**")
+                    for info in facility_debug_info:
+                        st.text(info)
+        except ValueError as e:
+            st.error(f"施設情報CSVファイルのエラー: {str(e)}")
+        except Exception as e:
+            st.error(f"施設情報CSVファイルの予期せぬエラー: {str(e)}")
+    
+    # ユーザーデータCSVファイルのアップロード（インポートデータ作成用）
+    user_csv_file = st.file_uploader("ユーザーデータCSVファイルを選択してください", type=['csv'], key="import_user")
+    user_data = None
+    
+    if user_csv_file:
+        try:
+            # ファイルが変更された場合のみセッション状態をリセット
+            if check_file_changed(user_csv_file, 'user'):
+                reset_import_session_state()
+            
+            # ユーザーデータCSVファイルの検証と読み込み
+            user_data, user_encoding, user_debug_info = validate_csv_file(user_csv_file)
+            
+            st.success(f"ユーザーデータCSVファイルが正常に読み込まれました（エンコーディング: {user_encoding}）")
+            with st.expander("ユーザーデータを確認する"):
+                st.dataframe(user_data, use_container_width=True)
+                
+            # デバッグモード時に詳細情報を表示
+            if st.session_state.get('debug_mode', False):
+                with st.expander("🔍 ユーザーデータCSV読み込み詳細"):
+                    st.write("**エンコーディング検出ログ:**")
+                    for info in user_debug_info:
+                        st.text(info)
+        except ValueError as e:
+            st.error(f"ユーザーデータCSVファイルのエラー: {str(e)}")
+        except Exception as e:
+            st.error(f"ユーザーデータCSVファイルの予期せぬエラー: {str(e)}")
+    
+    # 全てのデータが揃っているか確認
+    all_data_ready = (
+        main_data is not None and
+        original_data is not None and
+        facility_data is not None and
+        user_data is not None
+    )
+    
+    if all_data_ready:
+        st.success("全てのファイルが正常に読み込まれました。データ検証を開始できます。")
+        
+        # 自治体名と対象月の入力フィールドを2カラムで配置
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            municipality = st.text_input("自治体名", value="北九州市", help="インポートファイル名に使用される自治体名を入力してください", key="import_municipality")
+        
+        with col2:
+            current_month = datetime.datetime.now().month
+            target_month = st.number_input("ユーザー追加対象月", min_value=1, max_value=12, value=current_month, 
+                                         help="ユーザー追加の対象月を指定してください")
+        
+        # 検証項目の選択
+        st.write("### 実施する検証項目を選択してください")
+        
+        # 検証項目の定義（キー: (表示名, デフォルト値, ヘルプテキスト)）
+        validation_items = {
+            'modification_status': ('修正・削除新規ステータス', True, '修正・削除新規列の値が正しく設定されているかを検証します。修正時の変更有無、新規追加時のスラッグ空欄、掲載順変更の妥当性をチェックします。'),
+            'empty_status': ('空欄ステータス', True, '修正・削除新規列が空欄の場合に、実際にデータが変更されていないかを検証します。'),
+            'machine_dependent': ('機種依存文字', True, 'サークル名、概要、活動場所などの文字列項目に機種依存文字（①②③など）が含まれていないかをチェックします。'),
+            'cell_breaks': ('セル内改行', True, 'セル内に改行文字（\\n、\\r）が含まれていないかを検証します。データの表示崩れを防ぎます。'),
+            'prohibited_changes': ('変更禁止列', True, 'スラッグ、ステータス、参加者の条件（後半）、申込方法備考などの変更禁止列が変更されていないかをチェックします。'),
+            'consecutive_spaces': ('連続した空白', True, '文字列項目に3つ以上の連続した空白が含まれていないかを検証します。'),
+            'alphanumeric': ('半角英数', True, '電話番号、郵便番号、順番などの項目が半角英数字で入力されているかを検証します。'),
+            'email': ('メールアドレス', True, 'メールアドレス項目が正しい形式で入力されているかを検証します。'),
+            'required_fields': ('必須項目', True, 'サークル名、スラッグ、ステータス、活動種別などの必須項目が入力されているかをチェックします。'),
+            'circle_cross': ('マルバツ', True, '参加者の条件、要会費、掲載可能性などの項目が○または空欄で入力されているかを検証します。'),
+            'facility_location': ('活動場所', True, '活動場所に入力された施設名が施設情報データに存在するかを検証します。'),
+            'status_column': ('ステータス', True, 'ステータス列の値がpublish、private、または空欄のいずれかであるかを検証します。'),
+            'website_urls': ('webサイトURL', True, 'WebサイトURLが有効で、実際にアクセス可能かを検証します。（時間がかかる場合があります）'),
+            'account_issue_date': ('アカウント発行年月', True, 'アカウント発行年月が正しい和暦形式（例：R6,4）で入力されているかを検証します。')
+        }
+        
+        # チェックボックスを3列に均等配置
+        validation_states = {}
+        items_list = list(validation_items.items())
+        columns = st.columns(3)
+        
+        # 項目を3列に分散配置
+        for i, (key, (display_name, default_value, help_text)) in enumerate(items_list):
+            col_index = i % 3  # 順番に列を循環
+            with columns[col_index]:
+                # セッション状態に値があればそれを使用、なければデフォルト値を使用
+                checkbox_value = st.session_state.get(f"check_{key}", default_value)
+                validation_states[key] = st.checkbox(
+                    display_name,
+                    value=checkbox_value,
+                    help=help_text,
+                    key=f"check_{key}"
+                )
+        
+        # 全選択・全解除ボタン用のコールバック関数
+        def select_all_callback():
+            for key in validation_items.keys():
+                st.session_state[f"check_{key}"] = True
+        
+        def deselect_all_callback():
+            for key in validation_items.keys():
+                st.session_state[f"check_{key}"] = False
+        
+        col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 4])
+        with col_btn1:
+            st.button("全選択", key="select_all", on_click=select_all_callback)
+        
+        with col_btn2:
+            st.button("全解除", key="deselect_all", on_click=deselect_all_callback)
+        
+        if st.button("データ検証開始", key="start_validation"):
+            try:
+                with st.spinner("データ検証を実行中..."):
+                    # 選択された検証項目を取得
+                    validation_options = {key: validation_states[key] for key in validation_items.keys()}
+                    
+                    # データ検証を実行
+                    validated_data = perform_data_validation(main_data, original_data, facility_data, validation_options)
+                    
+                    # セッション状態に保存
+                    st.session_state.validated_data = validated_data
+                    st.session_state.validation_completed = True
+                    log_session_state_change("validation_completed", {
+                        'data_rows': len(validated_data),
+                        'selected_validations': list(validation_options.keys())
+                    })
+                    
+                    # エラーがある行の数を計算
+                    error_rows = validated_data[validated_data['エラー'] != '']
+                    error_count = len(error_rows)
+                    
+            except Exception as e:
+                st.error(f"データ検証中にエラーが発生しました: {str(e)}")
+                if st.session_state.get('debug_mode', False):
+                    st.exception(e)
+        
+        # セッション状態に基づいて検証結果を表示
+        if st.session_state.validation_completed and st.session_state.validated_data is not None:
+            validated_data = st.session_state.validated_data
+            
+            # エラーがある行の数を計算
+            error_rows = validated_data[validated_data['エラー'] != '']
+            error_count = len(error_rows)
+            
+            if error_count > 0:
+                st.error(f"データ検証が完了しました。{error_count}件のエラーが見つかりました。")
+                
+                # エラー詳細の表示
+                with st.expander(f"エラー詳細を確認する ({error_count}件)"):
+                    st.dataframe(error_rows[['サークル名', 'スラッグ', 'エラー']], use_container_width=True)
+                
+                # 全データ（エラー列付き）の表示
+                with st.expander("検証結果を確認する（全データ）"):
+                    st.dataframe(validated_data, use_container_width=True)
+                
+                # エラー付きデータのダウンロード
+                current_date = datetime.datetime.now().strftime("%Y%m%d")
+                error_file_name = f"{municipality}_データ検証結果_{current_date}.xlsx"
+                
+                # Excelファイルとして出力
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    validated_data.to_excel(writer, sheet_name='検証結果', index=False)
+                    error_rows.to_excel(writer, sheet_name='エラー一覧', index=False)
+                
+                output.seek(0)
+                st.download_button(
+                    label="検証結果をダウンロード",
+                    data=output,
+                    file_name=error_file_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                
+            else:
+                st.success("データ検証が完了しました。エラーは見つかりませんでした。")
+                
+                # バルーンは一度だけ表示
+                if not st.session_state.get('balloons_shown', False):
+                    st.balloons()
+                    st.session_state.balloons_shown = True
+                
+                # 全データの表示
+                with st.expander("検証結果を確認する"):
+                    st.dataframe(validated_data, use_container_width=True)
+                
+                # データ整形とインポートファイル作成
+                st.write("### インポートデータ作成")
+                
+                # インポートデータ作成用のコールバック関数
+                def create_import_data_callback():
+                    try:
+                        log_session_state_change("import_data_creation_started", {
+                            'municipality': municipality,
+                            'target_month': target_month
+                        })
+                        
+                        # データを整形
+                        formatted_data = format_for_import(main_data, original_data)
+                        log_session_state_change("data_formatted", {
+                            'formatted_rows': len(formatted_data)
+                        })
+                        
+                        # インポートファイルを作成
+                        import_files = create_import_files(formatted_data, user_data, municipality, target_month)
+                        log_session_state_change("import_files_created", {
+                            'file_count': len(import_files) if import_files else 0,
+                            'filenames': list(import_files.keys()) if import_files else []
+                        })
+                        
+                        # セッション状態に保存
+                        st.session_state.import_files = import_files
+                        st.session_state.formatted_data = formatted_data
+                        st.session_state.import_data_created = True
+                        log_session_state_change("import_data_creation_completed", {
+                            'success': True
+                        })
+                        
+                    except Exception as e:
+                        log_session_state_change("import_data_creation_error", {
+                            'error': str(e)
+                        })
+                        st.error(f"インポートデータ作成中にエラーが発生しました: {str(e)}")
+                        if st.session_state.get('debug_mode', False):
+                            st.exception(e)
+                
+                # インポートデータ作成ボタン
+                st.button("インポートデータ作成開始", key="start_import_creation", on_click=create_import_data_callback)
+                
+                # インポートデータが作成済みの場合、結果を表示
+                if st.session_state.import_data_created and st.session_state.import_files is not None:
+                    import_files = st.session_state.import_files
+                    formatted_data = st.session_state.formatted_data
+                    
+                    if import_files:
+                        st.success(f"{len(import_files)}個のインポートファイルが作成されました。")
+                        
+                        # アカウント発行年月の警告メッセージがある場合は表示
+                        if 'account_date_warning' in st.session_state:
+                            st.warning(st.session_state.account_date_warning)
+                            # 警告を表示したらセッション状態から削除（重複表示を防ぐ）
+                            del st.session_state.account_date_warning
+                        
+                        # 各ファイルのダウンロードボタンを表示
+                        for filename, data in import_files.items():
+                            # CSVファイルとして出力
+                            csv_output = io.StringIO()
+                            data.to_csv(csv_output, index=False, encoding='utf-8-sig')
+                            csv_data = csv_output.getvalue().encode('utf-8-sig')
+                            
+                            st.download_button(
+                                label=f"📁 {filename}",
+                                data=csv_data,
+                                file_name=filename,
+                                mime="text/csv",
+                                key=f"download_{filename}"
+                            )
+                            
+                            # ファイル内容のプレビュー
+                            with st.expander(f"📋 {filename} の内容を確認"):
+                                st.dataframe(data, use_container_width=True)
+                                st.info(f"行数: {len(data)}, 列数: {len(data.columns)}")
+
+                    else:
+                        st.warning("作成対象のインポートデータがありませんでした。")
+    
+
+
+def format_for_import(main_data, original_data):
+    """インポートデータ用に整形
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+        original_data (pd.DataFrame): 差分検出用データ
+    
+    Returns:
+        pd.DataFrame: 整形後のデータ
+    """
+    formatted_data = main_data.copy()
+    
+    # 数字へ置換
+    binary_columns = ['参加者の条件(妊娠)', '参加者の条件(0歳)', '参加者の条件(1歳)', 
+                     '参加者の条件(1歳後半)', '参加者の条件(2歳)', '参加者の条件(2歳後半)', 
+                     '参加者の条件(3歳)', '参加者の条件(4歳)', '参加者の条件(5歳)', 
+                     '参加者の条件(6歳)', '参加者の条件(どなたでも)', '要会費', 
+                     '冊子掲載可', 'HP掲載可', 'オープンデータ掲載可']
+    
+    for col in binary_columns:
+        if col in formatted_data.columns:
+            for idx, raw_value in formatted_data[col].items():
+                # 欠損値を統一的に処理
+                if pd.isna(raw_value):
+                    value = ''
+                else:
+                    value = str(raw_value).strip()
+                    if value in ['nan', 'None', '<NA>']:
+                        value = ''
+                
+                # 値の変換
+                if value == '' or value == '0':
+                    formatted_data.at[idx, col] = '0'
+                elif value == '○' or value == '1':
+                    formatted_data.at[idx, col] = '1'
+                else:
+                    # それ以外の値が入っていた場合はエラー扱い
+                    st.error(f"行{idx+1}の{col}列に無効な値が含まれています: {value}")
+                    formatted_data.at[idx, col] = '0'  # デフォルト値として0を設定
+    
+    # 参加者の条件(妊娠後半)列に参加者の条件(妊娠)列の値をコピー
+    if '参加者の条件(妊娠)' in formatted_data.columns and '参加者の条件(妊娠後半)' in formatted_data.columns:
+        formatted_data['参加者の条件(妊娠後半)'] = formatted_data['参加者の条件(妊娠)']
+    
+    # 入力禁止列の値の削除
+    prohibited_columns = ['申込方法備考', '活動日_営業時間ラベル', '活動日_営業曜日ラベル']
+    for col in prohibited_columns:
+        if col in formatted_data.columns:
+            formatted_data[col] = ''
+    
+    # 参加者の条件(出産)は一律「0」で埋める（入力禁止列だが、インポートデータでは「0」が必要）
+    if '参加者の条件(出産)' in formatted_data.columns:
+        formatted_data['参加者の条件(出産)'] = '0'
+    
+    # ステータスの修正（優先順位に従って処理）
+    for idx, row in formatted_data.iterrows():
+        # 修正・削除新規列の値を正規化
+        raw_status = row.get('修正・削除新規', '')
+        if pd.isna(raw_status):
+            status_value = ''
+        else:
+            status_value = str(raw_status).strip()
+            if status_value in ['nan', 'None', '<NA>']:
+                status_value = ''
+        
+        # HP掲載可列の値を正規化
+        raw_hp_publish = row.get('HP掲載可', '')
+        if pd.isna(raw_hp_publish):
+            hp_publish = ''
+        else:
+            hp_publish = str(raw_hp_publish).strip()
+            if hp_publish in ['nan', 'None', '<NA>']:
+                hp_publish = ''
+        
+        # 優先順位に従ってステータスを設定
+        # 1. 修正・削除新規列の値が「削除」である：ステータス列の値を「private」にする
+        if status_value == '削除':
+            formatted_data.at[idx, 'ステータス'] = 'private'
+        # 2. 修正・削除新規列の値が「削除」でない かつ 空欄である：ステータス列の値を「publish」にする
+        elif status_value != '削除' and status_value == '':
+            formatted_data.at[idx, 'ステータス'] = 'publish'
+        # 3. HP掲載可列の値が1である：ステータス列の値を「publish」にする
+        elif hp_publish == '1':
+            formatted_data.at[idx, 'ステータス'] = 'publish'
+        # 4. HP掲載可列の値が0である：ステータス列の値を「private」にする
+        elif hp_publish == '0':
+            formatted_data.at[idx, 'ステータス'] = 'private'
+        # デフォルト値
+        else:
+            formatted_data.at[idx, 'ステータス'] = 'publish'
+    
+    # 順番の修正（実際に変更が必要な行のみ処理）
+    formatted_data = formatted_data.reset_index(drop=True)
+    
+    # 元データとの順番比較用にスラッグをキーとした辞書を作成
+    original_order_dict = {}
+    for idx, row in original_data.iterrows():
+        raw_slug = row.get('スラッグ', '')
+        if pd.isna(raw_slug):
+            slug = ''
+        else:
+            slug = str(raw_slug).strip()
+            if slug in ['nan', 'None', '<NA>']:
+                slug = ''
+        
+        if slug:
+            raw_order = row.get('順番', '')
+            if pd.isna(raw_order):
+                order = ''
+            else:
+                order = str(raw_order).strip()
+                if order in ['nan', 'None', '<NA>']:
+                    order = ''
+            original_order_dict[slug] = order
+    
+    # 新しい順番を設定
+    formatted_data['順番'] = range(1, len(formatted_data) + 1)
+    
+    # 順番の差分チェックと修正・削除新規列の更新（実際に変更があった行のみ）
+    for idx, row in formatted_data.iterrows():
+        # スラッグの値を正規化
+        raw_slug = row.get('スラッグ', '')
+        if pd.isna(raw_slug):
+            slug = ''
+        else:
+            slug = str(raw_slug).strip()
+            if slug in ['nan', 'None', '<NA>']:
+                slug = ''
+        
+        # 現在のステータスを正規化
+        raw_current_status = row.get('修正・削除新規', '')
+        if pd.isna(raw_current_status):
+            current_status = ''
+        else:
+            current_status = str(raw_current_status).strip()
+            if current_status in ['nan', 'None', '<NA>']:
+                current_status = ''
+        
+        # すでに「修正」「削除」「新規追加」が入力されている場合は上書きしない
+        if current_status in ['修正', '削除', '新規追加']:
+            continue
+        
+        # スラッグが存在し、元データにも存在する場合のみ順番比較
+        if slug and slug in original_order_dict:
+            # 現在の順番を正規化
+            current_order = str(idx + 1)  # 新しい順番（1から始まる連番）
+            original_order = original_order_dict[slug]
+            
+            # 順番が実際に変更された場合のみ「掲載順」を設定
+            if current_order != original_order:
+                formatted_data.at[idx, '修正・削除新規'] = '掲載順'
+    
+    return formatted_data
+
+def create_import_files(formatted_data, user_data, municipality, target_month):
+    """インポートファイルの作成
+    
+    Args:
+        formatted_data (pd.DataFrame): 整形済みデータ
+        user_data (pd.DataFrame): ユーザーデータ
+        municipality (str): 自治体名
+        target_month (int): 対象月
+    
+    Returns:
+        dict: 作成されたファイルの辞書
+    """
+    current_date = datetime.datetime.now().strftime("%Y%m%d")
+    files = {}
+    
+    # 育児サークル用データのテンプレートヘッダー
+    circle_template_headers = [
+        'サークル名', 'スラッグ', 'ステータス', '活動種別', '概要',
+        '対象年齢(妊娠前半)', '対象年齢(妊娠後半)', '対象年齢(出産)',
+        '対象年齢(0歳)', '対象年齢(1歳前半)', '対象年齢(1歳後半)',
+        '対象年齢(2歳前半)', '対象年齢(2歳後半)', '対象年齢(3歳)',
+        '対象年齢(4歳)', '対象年齢(5歳)', '対象年齢(6歳(就学前))',
+        '対象年齢(6歳(就学後))', '活動場所', '申込方法', '申込方法備考',
+        '申込先電話番号', 'Eメールアドレス', '要会費', '会費', 'Webサイト',
+        '活動日_営業曜日', '活動日_開始時間', '活動日_終了時間',
+        '活動日_営業時間ラベル', '活動日_営業曜日ラベル', '活動日_備考',
+        '代表者', '団体名', '団体名（ふりがな）', '幼稚園・保育園チェック',
+        '冊子掲載可', 'HP掲載可', 'オープンデータ掲載可', '小学校区',
+        '小学校区（ふりがな）', '代表者名', '代表者名（ふりがな）',
+        '代表者郵便番号', '代表者住所', '代表者電話番号', '代表者FAX',
+        '代表者携帯番号', '記入者', '順番'
+    ]
+    
+    # CSVヘッダーとテンプレートヘッダーのマッピング
+    header_mapping = {
+        # 参加者の条件系の列名変換
+        '参加者の条件(妊娠)': '対象年齢(妊娠前半)',
+        '参加者の条件(妊娠後半)': '対象年齢(妊娠後半)',
+        '参加者の条件(出産)': '対象年齢(出産)',
+        '参加者の条件(0歳)': '対象年齢(0歳)',
+        '参加者の条件(1歳)': '対象年齢(1歳前半)',
+        '参加者の条件(1歳後半)': '対象年齢(1歳後半)',
+        '参加者の条件(2歳)': '対象年齢(2歳前半)',
+        '参加者の条件(2歳後半)': '対象年齢(2歳後半)',
+        '参加者の条件(3歳)': '対象年齢(3歳)',
+        '参加者の条件(4歳)': '対象年齢(4歳)',
+        '参加者の条件(5歳)': '対象年齢(5歳)',
+        '参加者の条件(6歳)': '対象年齢(6歳(就学前))',
+        '参加者の条件(どなたでも)': '対象年齢(6歳(就学後))',
+        # その他のヘッダーは同じ名前なのでマッピング不要
+    }
+    
+    # 新規追加の育児サークル
+    new_circles = formatted_data[formatted_data['修正・削除新規'] == '新規追加']
+    if not new_circles.empty:
+        # ヘッダーマッピング（CSVのヘッダーをテンプレートヘッダーに変換）
+        # 事前にDataFrameの構造を定義（全て文字列型として初期化）
+        new_circles_mapped = pd.DataFrame(index=new_circles.index, 
+                                        columns=circle_template_headers, 
+                                        dtype=str)
+        new_circles_mapped = new_circles_mapped.fillna('')
+        
+        for template_header in circle_template_headers:
+            # マッピングがある場合は元のヘッダー名を使用
+            csv_header = None
+            for csv_col, template_col in header_mapping.items():
+                if template_col == template_header:
+                    csv_header = csv_col
+                    break
+            
+            # マッピングがない場合は同じ名前を使用
+            if csv_header is None:
+                csv_header = template_header
+            
+            if csv_header in new_circles.columns:
+                # 欠損値を適切に処理して代入
+                series = new_circles[csv_header].fillna('').astype(str)
+                # 'nan'文字列を空文字に置換
+                series = series.replace(['nan', 'None', '<NA>'], '')
+                new_circles_mapped[template_header] = series
+            else:
+                new_circles_mapped[template_header] = ''
+        
+        files[f"{municipality}育児サークル{target_month}月_新規_{current_date}.csv"] = new_circles_mapped
+    
+    # 修正の育児サークル（明示的に指定された行のみ）
+    # 明示的に修正・削除・掲載順が指定されている行のみを修正CSVに含める
+    # 暗黙的な修正検出は行わない（インポートデータ整形処理による変更を除外するため）
+    modified_circles = formatted_data[formatted_data['修正・削除新規'].isin(['修正', '削除', '掲載順'])]
+    if not modified_circles.empty:
+        # ヘッダーマッピング（CSVのヘッダーをテンプレートヘッダーに変換）
+        # 事前にDataFrameの構造を定義（全て文字列型として初期化）
+        modified_circles_mapped = pd.DataFrame(index=modified_circles.index, 
+                                             columns=circle_template_headers, 
+                                             dtype=str)
+        modified_circles_mapped = modified_circles_mapped.fillna('')
+        
+        for template_header in circle_template_headers:
+            # マッピングがある場合は元のヘッダー名を使用
+            csv_header = None
+            for csv_col, template_col in header_mapping.items():
+                if template_col == template_header:
+                    csv_header = csv_col
+                    break
+            
+            # マッピングがない場合は同じ名前を使用
+            if csv_header is None:
+                csv_header = template_header
+            
+            if csv_header in modified_circles.columns:
+                # 欠損値を適切に処理して代入
+                series = modified_circles[csv_header].fillna('').astype(str)
+                # 'nan'文字列を空文字に置換
+                series = series.replace(['nan', 'None', '<NA>'], '')
+                modified_circles_mapped[template_header] = series
+            else:
+                modified_circles_mapped[template_header] = ''
+        
+        files[f"{municipality}育児サークル{target_month}月_修正_{current_date}.csv"] = modified_circles_mapped
+    
+    # ユーザー新規追加・修正の処理
+    user_import_data = create_user_import_data(formatted_data, user_data, target_month)
+    if not user_import_data.empty:
+        files[f"{municipality}{target_month}月_ユーザー登録{current_date}.csv"] = user_import_data
+    
+    return files
+
+def create_user_import_data(formatted_data, user_data, target_month):
+    """ユーザーインポートデータの作成
+    
+    Args:
+        formatted_data (pd.DataFrame): 整形済みデータ
+        user_data (pd.DataFrame): ユーザーデータ
+        target_month (int): 対象月
+    
+    Returns:
+        pd.DataFrame: ユーザーインポートデータ
+    """
+    user_import_df = pd.DataFrame(columns=['名前', 'スラッグ', 'メールアドレス', '自己紹介', '種類', 'Webサイト', '画像'])
+    
+    # 変換できない値を収集するリスト
+    invalid_values = []
+    
+    # 和暦から西暦への変換関数
+    def convert_wareki_to_seireki(wareki_str):
+        if pd.isna(wareki_str):
+            return None
+        
+        # 文字列に変換して正規化
+        wareki_str = str(wareki_str).strip()
+        if not wareki_str or wareki_str in ['nan', 'None', '<NA>']:
+            return None
+            
+        try:
+            # カンマまたはピリオドで分割
+            separator = ',' if ',' in wareki_str else '.' if '.' in wareki_str else None
+            if separator:
+                parts = wareki_str.split(separator)
+                if len(parts) == 2:
+                    year_part = parts[0].strip()
+                    month_part = int(parts[1].strip())
+                    
+                    # 月の範囲チェック
+                    if not (1 <= month_part <= 12):
+                        return False  # 無効な月
+                    
+                    if year_part.startswith('R'):
+                        # 令和
+                        reiwa_year = int(year_part[1:])
+                        # 令和年の妥当性チェック（令和1年〜令和50年程度まで）
+                        if not (1 <= reiwa_year <= 50):
+                            return False  # 無効な令和年
+                        seireki_year = 2018 + reiwa_year
+                        return seireki_year * 100 + month_part
+            return False  # 変換できない形式
+        except:
+            return False  # 変換エラー
+    
+    # 新規追加のユーザーデータ作成
+    target_month_code = datetime.datetime.now().year * 100 + target_month
+    
+    # アカウント発行有無の条件を正規化して評価
+    def is_account_issued(value):
+        if pd.isna(value):
+            return False
+        value_str = str(value).strip()
+        if value_str in ['nan', 'None', '<NA>']:
+            return False
+        return value_str == '○'
+    
+    # 変換できない値を収集しながら変換処理を実行
+    conversion_results = []
+    for idx, row in formatted_data.iterrows():
+        value = normalize_value(row.get('ｱｶｳﾝﾄ発行年月', ''))
+        if value:  # 空欄でない場合のみ変換を試行
+            conversion_result = convert_wareki_to_seireki(value)
+            if conversion_result is False:  # 変換できない場合
+                circle_name = row.get('サークル名', '不明')
+                if value not in [item['value'] for item in invalid_values]:
+                    invalid_values.append({
+                        'value': value,
+                        'circle_name': circle_name,
+                        'row_number': idx + 1
+                    })
+            conversion_results.append(conversion_result)
+        else:
+            conversion_results.append(None)
+    
+    # 変換できない値がある場合は警告情報をセッション状態に保存
+    if invalid_values:
+        warning_message = "### ⚠️ アカウント発行年月に変換できない値が見つかりました\n\n"
+        warning_message += "**正しい形式**: R6,4 または R6.4 （令和6年4月の場合）\n\n"
+        warning_message += "**変換できない値一覧**:\n"
+        
+        for item in invalid_values:
+            warning_message += f"- 行{item['row_number']}: 「{item['value']}」（サークル名: {item['circle_name']}）\n"
+        
+        warning_message += "\n**修正方法**:\n"
+        warning_message += "1. 年と月をカンマ（,）またはピリオド（.）で区切ってください\n"
+        warning_message += "2. 令和年は「R」で始めてください（例: R6,4）\n"
+        warning_message += "3. 月は1〜12の範囲で入力してください\n"
+        
+        # 警告メッセージをセッション状態に保存（重複を避けるため）
+        if 'account_date_warning' not in st.session_state:
+            st.session_state.account_date_warning = warning_message
+    
+    # 変換結果をDataFrameに追加して条件で絞り込み
+    formatted_data_with_conversion = formatted_data.copy()
+    formatted_data_with_conversion['_conversion_result'] = conversion_results
+    
+    new_accounts = formatted_data_with_conversion[
+        formatted_data_with_conversion['ｱｶｳﾝﾄ発行有無'].apply(is_account_issued) &
+        (formatted_data_with_conversion['_conversion_result'] == target_month_code)
+    ]
+    
+    # デバッグ情報をセッション状態に保存（表示は後で行う）
+    if st.session_state.get('debug_mode', False):
+        # アカウント発行有無の状況
+        account_issued_count = formatted_data['ｱｶｳﾝﾄ発行有無'].apply(is_account_issued).sum()
+        
+        # アカウント発行年月の状況
+        month_matches = formatted_data['ｱｶｳﾝﾄ発行年月'].apply(convert_wareki_to_seireki) == target_month_code
+        month_match_count = month_matches.sum()
+        
+        # アカウント発行年月の変換結果を詳細に記録
+        conversion_details = []
+        for idx, row in formatted_data.iterrows():
+            original_value = row.get('ｱｶｳﾝﾄ発行年月', '')
+            converted_value = convert_wareki_to_seireki(original_value)
+            conversion_details.append({
+                'サークル名': row.get('サークル名', ''),
+                '元の値': original_value,
+                '変換後': converted_value
+            })
+        
+        conversion_df = pd.DataFrame(conversion_details)
+        
+        # デバッグ情報をセッション状態に保存
+        debug_info = {
+            'target_month_code': target_month_code,
+            'total_rows': len(formatted_data),
+            'account_issued_count': account_issued_count,
+            'month_match_count': month_match_count,
+            'new_accounts_count': len(new_accounts),
+            'new_accounts_sample': new_accounts[['サークル名', 'ｱｶｳﾝﾄ発行有無', 'ｱｶｳﾝﾄ発行年月', 'アカウント発行の登録用メールアドレス']].head() if len(new_accounts) > 0 else None,
+            'account_values': formatted_data['ｱｶｳﾝﾄ発行有無'].value_counts() if len(new_accounts) == 0 else None,
+            'month_values': formatted_data['ｱｶｳﾝﾄ発行年月'].apply(convert_wareki_to_seireki).value_counts() if len(new_accounts) == 0 else None,
+            'conversion_details': conversion_df
+        }
+        st.session_state.user_csv_debug_info = debug_info
+    
+    if not new_accounts.empty:
+        # 既存のスラッグから次の番号を取得
+        existing_slugs = user_data['スラッグ'].astype(str)
+        cs_numbers = []
+        for slug in existing_slugs:
+            if slug.startswith('cs') and slug[2:].isdigit():
+                num = int(slug[2:])
+                if 1 <= num <= 9998:  # cs9999は除外
+                    cs_numbers.append(num)
+        
+        next_number = max(cs_numbers) + 1 if cs_numbers else 1
+        
+        for idx, row in new_accounts.iterrows():
+            # サークル名の正規化
+            raw_circle_name = row.get('サークル名', '')
+            if pd.isna(raw_circle_name):
+                circle_name = ''
+            else:
+                circle_name = str(raw_circle_name).strip()
+                if circle_name in ['nan', 'None', '<NA>']:
+                    circle_name = ''
+            
+            # メールアドレスの正規化
+            raw_email = row.get('アカウント発行の登録用メールアドレス', '')
+            if pd.isna(raw_email):
+                email = ''
+            else:
+                email = str(raw_email).strip()
+                if email in ['nan', 'None', '<NA>']:
+                    email = ''
+            
+            # 必須項目のチェック
+            if not circle_name or not email:
+                st.warning(f"行{idx+1}: サークル名またはメールアドレスが空のため、ユーザー作成をスキップします")
+                continue
+            
+            # メールアドレスの重複チェック
+            if email in user_data['メールアドレス'].values:
+                st.error(f"メールアドレス '{email}' は既に登録されています（サークル名: {circle_name}）")
+                continue
+            
+            new_slug = f"cs{next_number:04d}"
+            
+            new_user = {
+                '名前': circle_name,
+                'スラッグ': new_slug,
+                'メールアドレス': email,
+                '自己紹介': '',
+                '種類': 'blog_writer',
+                'Webサイト': '',
+                '画像': ''
+            }
+            
+            user_import_df = pd.concat([user_import_df, pd.DataFrame([new_user])], ignore_index=True)
+            next_number += 1
+    
+    # 修正のユーザーデータ作成（実装は次のステップで完成予定）
+    # TODO: アカウント発行有無列の差分チェックと既存ユーザーの更新
+    
+    return user_import_df
+
+def main():
+    initialize_session_state()
+    log_session_state_change("app_started", {})
+    
+    # サイドバーにデバッグモードの切り替えと使い方を追加
+    with st.sidebar:
+        st.session_state.debug_mode = st.checkbox("デバッグモード", value=st.session_state.debug_mode)
+        
+        # バージョン情報（控えめに表示）
+        st.markdown("---")
+        st.caption("v1.1 - 2025/01/25")
+    
+    st.title("育児サークル情報処理アプリ")
+    
+    # タブの作成
+    tab1, tab2 = st.tabs([
+        "データ修正用エクセル作成",
+        "インポートデータ作成"
+    ])
+    
+    # タブの内容を表示
+    with tab1:
+        # データ修正用エクセル作成タブの使い方をサイドバーに表示
+        with st.sidebar:
+            st.markdown("---")
+            st.markdown("### 📊 データ修正用エクセル作成の使い方")
+            st.markdown("""
+            1. 育児サークルCSVファイルをアップロード
+            2. 施設情報CSVファイルをアップロード
+            3. 先月分のデータ（Excelファイル）をアップロード
+            4. 自治体名を入力（デフォルト：北九州市様）
+            5. 「処理開始」ボタンをクリック
+            6. 処理が完了したら「処理済みファイルをダウンロード」ボタンが表示される
+            7. ダウンロードしたExcelファイルで修正作業を行う
+            """)
+        
+        show_modification_excel_page()
+    
+    with tab2:
+        # インポートデータ作成タブの使い方をサイドバーに表示
+        with st.sidebar:
+            st.markdown("---")
+            st.markdown("### 📋 インポートデータ作成の使い方")
+            st.markdown("""
+            1. 修正済みExcelファイルをアップロード
+            2. 必要に応じてスキップする行数を調整
+            3. 施設情報CSVファイルとユーザーデータCSVファイルをアップロード
+            4. 「データ検証開始」ボタンをクリック
+            5. 検証結果を確認
+               - エラーがある場合：エラーを修正してから再度検証
+               - エラーが0件の場合：次のステップに進む
+            6. **エラーが0件の場合のみ**「インポートデータ作成開始」ボタンをクリック
+            7. インポートデータが作成されたら、各ファイルをダウンロード
+            """)
+        
+        show_import_data_page()
 
 if __name__ == "__main__":
     main() 
