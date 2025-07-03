@@ -1,0 +1,12 @@
+﻿名前,スラッグ,メールアドレス,自己紹介,種類,Webサイト,画像
+修正サークル1（旧名前）,cs0001,modified1_old@example.com,修正サークル1の自己紹介,blog_writer,https://old1.com,
+修正サークル2（旧名前）,cs0002,modified2_old@example.com,修正サークル2の自己紹介,blog_writer,https://old2.com,
+削除サークル1,cs0003,deleted1@example.com,削除サークル1の自己紹介,blog_writer,https://deleted1.com,
+掲載順変更サークル1,cs0004,order1@example.com,掲載順変更サークル1の自己紹介,blog_writer,https://order1.com,
+ユーザー新規追加サークル2（旧名前）,cs0008,usernew2@example.com,ユーザー新規追加サークル2の自己紹介,blog_writer,https://usernew2.com,
+ユーザー修正サークル1（旧名前）,cs0009,usermod1_old@example.com,ユーザー修正サークル1の自己紹介,blog_writer,https://usermod1.com,
+ユーザー修正サークル2（旧名前）,cs0010,usermod2_old@example.com,ユーザー修正サークル2の自己紹介,blog_writer,https://usermod2.com,
+アカウント発行有無変更サークル1,cs0011,account1@example.com,アカウント発行有無変更サークル1の自己紹介,blog_writer,https://account1.com,
+変更なしサークル1,cs0012,nochange1@example.com,変更なしサークル1の自己紹介,blog_writer,https://nochange1.com,
+既存ユーザー1,cs0101,existing1@example.com,既存ユーザー1の自己紹介,blog_writer,https://existing1.com,
+既存ユーザー2,cs0102,existing2@example.com,既存ユーザー2の自己紹介,blog_writer,https://existing2.com,
