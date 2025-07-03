@@ -697,12 +697,11 @@ def show_session_state_debug():
             
             col1, col2 = st.columns(2)
             with col1:
-                st.write(f"📅 対象月コード: {debug_info['target_month_code']}")
                 st.write(f"📊 全データ行数: {debug_info['total_rows']}")
                 st.write(f"✅ アカウント発行有無が○の行数: {debug_info['account_issued_count']}")
             
             with col2:
-                st.write(f"📆 アカウント発行年月が対象月と一致: {debug_info['month_match_count']}")
+                st.write(f"📧 メールアドレス記載の行数: {debug_info['email_filled_count']}")
                 st.write(f"🎯 両方の条件を満たす行数: {debug_info['new_accounts_count']}")
             
             # サンプルデータまたは原因調査の表示
@@ -717,14 +716,7 @@ def show_session_state_debug():
                     st.write("**アカウント発行有無列の値の分布:**")
                     st.write(debug_info['account_values'])
                 
-                if debug_info['month_values'] is not None:
-                    st.write("**アカウント発行年月列の値の分布（変換後）:**")
-                    st.write(debug_info['month_values'])
-            
-            # アカウント発行年月の変換詳細を表示
-            if 'conversion_details' in debug_info and debug_info['conversion_details'] is not None:
-                st.write("**📅 アカウント発行年月の変換詳細:**")
-                st.dataframe(debug_info['conversion_details'], use_container_width=True)
+
             
             # デバッグ情報クリアボタン
             if st.button("ユーザーCSVデバッグ情報をクリア", key="clear_user_csv_debug"):
@@ -748,6 +740,14 @@ def reset_import_session_state():
     # 警告メッセージもクリア
     if 'account_date_warning' in st.session_state:
         del st.session_state.account_date_warning
+    
+    # ユーザー作成警告もクリア
+    if 'user_creation_warning' in st.session_state:
+        del st.session_state.user_creation_warning
+    
+    # ユーザー修正情報もクリア
+    if 'user_modification_details' in st.session_state:
+        del st.session_state.user_modification_details
 
 def check_file_changed(file, file_type):
     """ファイルが変更されたかチェックし、変更された場合のみセッション状態をリセット
@@ -963,8 +963,9 @@ def validate_modification_status(main_data, original_data):
                 # 差分検出用データから同じスラッグの行を取得
                 original_row = original_data[original_data['スラッグ'] == slug]
                 if not original_row.empty:
-                    # 修正・削除新規列以外の列で差分をチェック
-                    check_columns = [col for col in main_data.columns if col != '修正・削除新規']
+                    # 修正・削除新規列とアカウント関連列以外の列で差分をチェック
+                    excluded_columns = ['修正・削除新規', 'ｱｶｳﾝﾄ発行有無', 'ｱｶｳﾝﾄ発行年月', 'アカウント発行の登録用メールアドレス']
+                    check_columns = [col for col in main_data.columns if col not in excluded_columns]
                     has_difference = False
                     
                     for col in check_columns:
@@ -977,7 +978,9 @@ def validate_modification_status(main_data, original_data):
                                 break
                     
                     if not has_difference:
-                        error_list.append("修正にもかかわらず、値が変更されていません")
+                        # アカウント関連のみの変更の場合はエラーとしない
+                        if not is_only_account_related_change(row, original_data):
+                            error_list.append("修正にもかかわらず、値が変更されていません")
         
         # 新規追加ステータスの検証
         elif status == '新規追加':
@@ -1022,8 +1025,9 @@ def validate_empty_status(main_data, original_data):
             if slug:
                 original_row = original_data[original_data['スラッグ'] == slug]
                 if not original_row.empty:
-                    # 修正・削除新規列以外の列で差分をチェック
-                    check_columns = [col for col in main_data.columns if col != '修正・削除新規']
+                    # 修正・削除新規列とアカウント関連列以外の列で差分をチェック
+                    excluded_columns = ['修正・削除新規', 'ｱｶｳﾝﾄ発行有無', 'ｱｶｳﾝﾄ発行年月', 'アカウント発行の登録用メールアドレス']
+                    check_columns = [col for col in main_data.columns if col not in excluded_columns]
                     changed_columns = []
                     
                     for col in check_columns:
@@ -1307,8 +1311,13 @@ async def validate_website_urls(main_data):
     Returns:
         list: エラーメッセージのリスト
     """
-    from validate import is_url_alive
-    import aiohttp
+    try:
+        from validate import is_url_alive
+        import aiohttp
+    except ImportError as e:
+        # validate.pyが存在しない場合は検証をスキップ
+        st.warning(f"WebサイトURL検証をスキップします: {str(e)}")
+        return [''] * len(main_data)
     
     errors = []
     target_column = 'Webサイト'
@@ -1321,12 +1330,7 @@ async def validate_website_urls(main_data):
     for idx, row in main_data.iterrows():
         raw_value = row.get(target_column, '')
         # 空欄と欠損値を同じものとして扱う
-        if pd.isna(raw_value):
-            value = ''
-        else:
-            value = str(raw_value).strip()
-            if value == 'nan' or value == 'None' or value == '<NA>':
-                value = ''
+        value = normalize_value(raw_value)
         
         if value:  # 空欄でない場合のみチェック
             # @で始まる場合は@を除去
@@ -1339,18 +1343,49 @@ async def validate_website_urls(main_data):
     if not urls_to_check:
         return errors
     
+    # プログレスバーとステータステキストを表示（URL数が2以上の場合のみ）
+    progress_bar = None
+    status_text = None
+    total_urls = len(urls_to_check)
+    
+    if total_urls >= 2:
+        st.info(f"WebサイトURL検証を開始します（{total_urls}件のURLを検証）")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        status_text.text(f"WebサイトURL検証中: 0/{total_urls}")
+    
     # 非同期でURL検証を実行
-    async with aiohttp.ClientSession() as session:
-        for idx, url in urls_to_check:
-            try:
-                _, error_msg = await is_url_alive(url, target_column, session)
-                if idx >= len(errors):
-                    errors.extend([''] * (idx - len(errors) + 1))
-                errors[idx] = error_msg
-            except Exception as e:
-                if idx >= len(errors):
-                    errors.extend([''] * (idx - len(errors) + 1))
-                errors[idx] = f"{target_column}列でURL検証エラー: {str(e)}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            for current_index, (idx, url) in enumerate(urls_to_check):
+                try:
+                    # プログレスバーの更新
+                    if progress_bar is not None:
+                        progress = (current_index + 1) / total_urls
+                        progress_bar.progress(progress)
+                        status_text.text(f"WebサイトURL検証中: {current_index + 1}/{total_urls} - {url[:50]}{'...' if len(url) > 50 else ''}")
+                    
+                    _, error_msg = await is_url_alive(url, target_column, session)
+                    if idx >= len(errors):
+                        errors.extend([''] * (idx - len(errors) + 1))
+                    errors[idx] = error_msg
+                except Exception as e:
+                    if idx >= len(errors):
+                        errors.extend([''] * (idx - len(errors) + 1))
+                    errors[idx] = f"{target_column}列でURL検証エラー: {str(e)}"
+    except Exception as e:
+        # aiohttp関連のエラーの場合
+        st.warning(f"WebサイトURL検証でエラーが発生しました: {str(e)}")
+        # エラーが発生した場合は空のエラーリストを返す
+        for idx, _ in urls_to_check:
+            if idx >= len(errors):
+                errors.extend([''] * (idx - len(errors) + 1))
+    finally:
+        # プログレスバーとステータステキストをクリア
+        if progress_bar is not None:
+            progress_bar.empty()
+        if status_text is not None:
+            status_text.empty()
     
     # 不足分を空文字で埋める
     while len(errors) < len(main_data):
@@ -1491,6 +1526,124 @@ def validate_account_issue_date(main_data):
     
     return errors
 
+def validate_weekdays(main_data):
+    """曜日の検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    target_column = '活動日_営業曜日'
+    
+    if target_column not in main_data.columns:
+        return [''] * len(main_data)
+    
+    valid_days = {'月', '火', '水', '木', '金', '土', '日', '祝'}
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        
+        value = normalize_value(row.get(target_column, ''))
+        
+        # 空欄でない場合のみチェック
+        if value:
+            try:
+                days = set(value.split(','))  # カンマで分割してセットに変換
+                if not days.issubset(valid_days):
+                    error_list.append("活動日_営業曜日列はカンマ区切りで入力してください")
+            except AttributeError:
+                error_list.append("活動日_営業曜日列はカンマ区切りで入力してください")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
+def validate_business_hours(main_data):
+    """時間の検証
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+    
+    Returns:
+        list: エラーメッセージのリスト
+    """
+    errors = []
+    start_column = '活動日_開始時間'
+    end_column = '活動日_終了時間'
+    
+    # 列が存在しない場合は空のエラーリストを返す
+    if start_column not in main_data.columns or end_column not in main_data.columns:
+        return [''] * len(main_data)
+    
+    def is_valid_time_format(time_str):
+        """時間形式が正しいかチェック"""
+        if not time_str:
+            return False
+        try:
+            # HH:MM または HH:MM:SS 形式をチェック
+            if ':' not in time_str:
+                return False
+            
+            parts = time_str.split(':')
+            if len(parts) == 2:  # HH:MM
+                hours, minutes = map(int, parts)
+                return 0 <= hours <= 23 and 0 <= minutes <= 59
+            elif len(parts) == 3:  # HH:MM:SS
+                hours, minutes, seconds = map(int, parts)
+                return 0 <= hours <= 23 and 0 <= minutes <= 59 and 0 <= seconds <= 59
+            else:
+                return False
+        except (ValueError, TypeError):
+            return False
+    
+    def time_to_minutes(time_str):
+        """時間文字列を分に変換（比較用）"""
+        try:
+            parts = time_str.split(':')
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            return hours * 60 + minutes
+        except (ValueError, IndexError):
+            return None
+    
+    for idx, row in main_data.iterrows():
+        error_list = []
+        
+        start_value = normalize_value(row.get(start_column, ''))
+        end_value = normalize_value(row.get(end_column, ''))
+        
+        # 両方空欄の場合は検証しない
+        if not start_value and not end_value:
+            errors.append('')
+            continue
+        
+        # 開始時間の形式チェック
+        start_valid = is_valid_time_format(start_value) if start_value else True
+        end_valid = is_valid_time_format(end_value) if end_value else True
+        
+        if start_value and not start_valid:
+            if end_value and not end_valid:
+                error_list.append("開始+終了時間の形式が違います")
+            else:
+                error_list.append("開始時間の形式が違います")
+        elif end_value and not end_valid:
+            error_list.append("終了時間の形式が違います")
+        elif start_value and end_value and start_valid and end_valid:
+            # 開始時間と終了時間の論理チェック
+            start_minutes = time_to_minutes(start_value)
+            end_minutes = time_to_minutes(end_value)
+            
+            if start_minutes is not None and end_minutes is not None:
+                if start_minutes >= end_minutes:
+                    error_list.append("開始時間と終了時間が同じまたは逆転しています")
+        
+        errors.append(', '.join(error_list) if error_list else '')
+    
+    return errors
+
 def perform_data_validation(main_data, original_data, facility_data=None, validation_options=None):
     """データ検証の実行
     
@@ -1522,7 +1675,9 @@ def perform_data_validation(main_data, original_data, facility_data=None, valida
             'facility_location': True,
             'status_column': True,
             'website_urls': True,
-            'account_issue_date': True
+            'account_issue_date': True,
+            'weekdays': True,
+            'business_hours': True
         }
     
     # 各検証を実行
@@ -1539,7 +1694,9 @@ def perform_data_validation(main_data, original_data, facility_data=None, valida
         ('circle_cross', 'マルバツ', lambda: validate_circle_or_cross(main_data)),
         ('facility_location', '活動場所', lambda: validate_facility_location(main_data, facility_data)),
         ('status_column', 'ステータス', lambda: validate_status_column(main_data)),
-        ('account_issue_date', 'アカウント発行年月', lambda: validate_account_issue_date(main_data))
+        ('account_issue_date', 'アカウント発行年月', lambda: validate_account_issue_date(main_data)),
+        ('weekdays', '曜日', lambda: validate_weekdays(main_data)),
+        ('business_hours', '時間', lambda: validate_business_hours(main_data))
     ]
     
     # 非同期検証（webサイトURL検証）
@@ -1773,16 +1930,8 @@ def show_import_data_page():
     if all_data_ready:
         st.success("全てのファイルが正常に読み込まれました。データ検証を開始できます。")
         
-        # 自治体名と対象月の入力フィールドを2カラムで配置
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            municipality = st.text_input("自治体名", value="北九州市", help="インポートファイル名に使用される自治体名を入力してください", key="import_municipality")
-        
-        with col2:
-            current_month = datetime.datetime.now().month
-            target_month = st.number_input("ユーザー追加対象月", min_value=1, max_value=12, value=current_month, 
-                                         help="ユーザー追加の対象月を指定してください")
+                # 自治体名の入力フィールド
+        municipality = st.text_input("自治体名", value="北九州市", help="インポートファイル名に使用される自治体名を入力してください", key="import_municipality")
         
         # 検証項目の選択
         st.write("### 実施する検証項目を選択してください")
@@ -1802,7 +1951,8 @@ def show_import_data_page():
             'facility_location': ('活動場所', True, '活動場所に入力された施設名が施設情報データに存在するかを検証します。'),
             'status_column': ('ステータス', True, 'ステータス列の値がpublish、private、または空欄のいずれかであるかを検証します。'),
             'website_urls': ('webサイトURL', True, 'WebサイトURLが有効で、実際にアクセス可能かを検証します。（時間がかかる場合があります）'),
-            'account_issue_date': ('アカウント発行年月', True, 'アカウント発行年月が正しい和暦形式（例：R6,4）で入力されているかを検証します。')
+            'weekdays': ('曜日', True, '活動日_営業曜日列がカンマ区切りの正しい曜日形式（月,火,水など）で入力されているかを検証します。'),
+            'business_hours': ('時間', True, '活動日_開始時間と活動日_終了時間がHH:MM形式で入力され、開始時間が終了時間より前であることを検証します。')
         }
         
         # チェックボックスを3列に均等配置
@@ -1921,8 +2071,7 @@ def show_import_data_page():
                 def create_import_data_callback():
                     try:
                         log_session_state_change("import_data_creation_started", {
-                            'municipality': municipality,
-                            'target_month': target_month
+                            'municipality': municipality
                         })
                         
                         # データを整形
@@ -1932,7 +2081,7 @@ def show_import_data_page():
                         })
                         
                         # インポートファイルを作成
-                        import_files = create_import_files(formatted_data, user_data, municipality, target_month)
+                        import_files = create_import_files(formatted_data, original_data, user_data, municipality, main_data)
                         log_session_state_change("import_files_created", {
                             'file_count': len(import_files) if import_files else 0,
                             'filenames': list(import_files.keys()) if import_files else []
@@ -1971,25 +2120,90 @@ def show_import_data_page():
                             # 警告を表示したらセッション状態から削除（重複表示を防ぐ）
                             del st.session_state.account_date_warning
                         
+                        # ユーザー作成の警告メッセージがある場合は表示
+                        if 'user_creation_warning' in st.session_state:
+                            st.warning(st.session_state.user_creation_warning)
+                            # 警告を表示したらセッション状態から削除（重複表示を防ぐ）
+                            del st.session_state.user_creation_warning
+                        
+                        # ユーザー修正の差分表示
+                        if 'user_modification_details' in st.session_state:
+                            st.info("### 👤 ユーザー情報の修正内容")
+                            modification_df = pd.DataFrame(st.session_state.user_modification_details)
+                            st.dataframe(modification_df, use_container_width=True, hide_index=True)
+                            st.caption("上記のユーザー情報が修正されます。内容を確認してからダウンロードしてください。")
+                            # 表示したらセッション状態から削除（重複表示を防ぐ）
+                            del st.session_state.user_modification_details
+                        
+                        # 削除対象データの表示
+                        deletion_data = formatted_data[formatted_data['修正・削除新規'] == '削除']
+                        if not deletion_data.empty:
+                            st.warning("### 🗑️ 削除対象データ")
+                            st.write("以下のデータについてはインポートで消えないため、管理画面から**ボミ箱ポイ**を忘れずに")
+                            
+                            # 削除対象データの表示（重要な列のみ）
+                            display_columns = ['サークル名', 'スラッグ', 'ステータス', '修正・削除新規']
+                            available_columns = [col for col in display_columns if col in deletion_data.columns]
+                            
+                            st.dataframe(
+                                deletion_data[available_columns], 
+                                use_container_width=True, 
+                                hide_index=True
+                            )
+                            st.caption(f"💡 削除対象: {len(deletion_data)}件のサークルデータ")
+                            st.caption("⚠️ これらのデータはインポート後にステータスが「private」になりますが、完全に削除されるわけではありません。")
+                            st.caption("📋 管理画面から手動でゴミ箱に移動する作業が必要です。")
+                        
+                        # インポート用CSVダウンロードセクションの見出し
+                        st.markdown("---")
+                        st.subheader("📥 インポート用CSVファイルダウンロード")
+                        st.write("作成されたインポート用CSVファイルをダウンロードしてください。")
+                        
                         # 各ファイルのダウンロードボタンを表示
                         for filename, data in import_files.items():
-                            # CSVファイルとして出力
-                            csv_output = io.StringIO()
-                            data.to_csv(csv_output, index=False, encoding='utf-8-sig')
-                            csv_data = csv_output.getvalue().encode('utf-8-sig')
-                            
-                            st.download_button(
-                                label=f"📁 {filename}",
-                                data=csv_data,
-                                file_name=filename,
-                                mime="text/csv",
-                                key=f"download_{filename}"
-                            )
-                            
-                            # ファイル内容のプレビュー
-                            with st.expander(f"📋 {filename} の内容を確認"):
-                                st.dataframe(data, use_container_width=True)
-                                st.info(f"行数: {len(data)}, 列数: {len(data.columns)}")
+                            # 修正CSVファイルの場合は特別な処理
+                            if isinstance(data, dict) and 'display_data' in data and 'download_data' in data:
+                                # 修正CSVファイルの場合
+                                display_data = data['display_data']  # 表示用（修正対象列含む）
+                                download_data = data['download_data']  # ダウンロード用（修正対象列除外）
+                                
+                                # CSVファイルとして出力（ダウンロード用データを使用）
+                                csv_output = io.StringIO()
+                                download_data.to_csv(csv_output, index=False, encoding='utf-8-sig')
+                                csv_data = csv_output.getvalue().encode('utf-8-sig')
+                                
+                                st.download_button(
+                                    label=f"📁 {filename}",
+                                    data=csv_data,
+                                    file_name=filename,
+                                    mime="text/csv",
+                                    key=f"download_{filename}"
+                                )
+                                
+                                # ファイル内容のプレビュー（表示用データを使用）
+                                with st.expander(f"📋 {filename} の内容を確認"):
+                                    st.dataframe(display_data, use_container_width=True)
+                                    st.info(f"行数: {len(display_data)}, 列数: {len(display_data.columns)}")
+                                    st.caption("💡 「修正対象列」は内容確認用の列で、ダウンロードファイルには含まれません。")
+                            else:
+                                # 通常のファイルの場合
+                                # CSVファイルとして出力
+                                csv_output = io.StringIO()
+                                data.to_csv(csv_output, index=False, encoding='utf-8-sig')
+                                csv_data = csv_output.getvalue().encode('utf-8-sig')
+                                
+                                st.download_button(
+                                    label=f"📁 {filename}",
+                                    data=csv_data,
+                                    file_name=filename,
+                                    mime="text/csv",
+                                    key=f"download_{filename}"
+                                )
+                                
+                                # ファイル内容のプレビュー
+                                with st.expander(f"📋 {filename} の内容を確認"):
+                                    st.dataframe(data, use_container_width=True)
+                                    st.info(f"行数: {len(data)}, 列数: {len(data.columns)}")
 
                     else:
                         st.warning("作成対象のインポートデータがありませんでした。")
@@ -2017,14 +2231,12 @@ def format_for_import(main_data, original_data):
     
     for col in binary_columns:
         if col in formatted_data.columns:
+            # 列を文字列型に変換（警告を回避）
+            formatted_data[col] = formatted_data[col].astype(str)
+            
             for idx, raw_value in formatted_data[col].items():
-                # 欠損値を統一的に処理
-                if pd.isna(raw_value):
-                    value = ''
-                else:
-                    value = str(raw_value).strip()
-                    if value in ['nan', 'None', '<NA>']:
-                        value = ''
+                # normalize_value関数を使用して統一的に処理
+                value = normalize_value(raw_value)
                 
                 # 値の変換
                 if value == '' or value == '0':
@@ -2048,27 +2260,17 @@ def format_for_import(main_data, original_data):
     
     # 参加者の条件(出産)は一律「0」で埋める（入力禁止列だが、インポートデータでは「0」が必要）
     if '参加者の条件(出産)' in formatted_data.columns:
+        # 列を文字列型に変換してから値を設定（警告を回避）
+        formatted_data['参加者の条件(出産)'] = formatted_data['参加者の条件(出産)'].astype(str)
         formatted_data['参加者の条件(出産)'] = '0'
     
     # ステータスの修正（優先順位に従って処理）
     for idx, row in formatted_data.iterrows():
         # 修正・削除新規列の値を正規化
-        raw_status = row.get('修正・削除新規', '')
-        if pd.isna(raw_status):
-            status_value = ''
-        else:
-            status_value = str(raw_status).strip()
-            if status_value in ['nan', 'None', '<NA>']:
-                status_value = ''
+        status_value = normalize_value(row.get('修正・削除新規', ''))
         
         # HP掲載可列の値を正規化
-        raw_hp_publish = row.get('HP掲載可', '')
-        if pd.isna(raw_hp_publish):
-            hp_publish = ''
-        else:
-            hp_publish = str(raw_hp_publish).strip()
-            if hp_publish in ['nan', 'None', '<NA>']:
-                hp_publish = ''
+        hp_publish = normalize_value(row.get('HP掲載可', ''))
         
         # 優先順位に従ってステータスを設定
         # 1. 修正・削除新規列の値が「削除」である：ステータス列の値を「private」にする
@@ -2093,22 +2295,10 @@ def format_for_import(main_data, original_data):
     # 元データとの順番比較用にスラッグをキーとした辞書を作成
     original_order_dict = {}
     for idx, row in original_data.iterrows():
-        raw_slug = row.get('スラッグ', '')
-        if pd.isna(raw_slug):
-            slug = ''
-        else:
-            slug = str(raw_slug).strip()
-            if slug in ['nan', 'None', '<NA>']:
-                slug = ''
+        slug = normalize_value(row.get('スラッグ', ''))
         
         if slug:
-            raw_order = row.get('順番', '')
-            if pd.isna(raw_order):
-                order = ''
-            else:
-                order = str(raw_order).strip()
-                if order in ['nan', 'None', '<NA>']:
-                    order = ''
+            order = normalize_value(row.get('順番', ''))
             original_order_dict[slug] = order
     
     # 新しい順番を設定
@@ -2117,22 +2307,10 @@ def format_for_import(main_data, original_data):
     # 順番の差分チェックと修正・削除新規列の更新（実際に変更があった行のみ）
     for idx, row in formatted_data.iterrows():
         # スラッグの値を正規化
-        raw_slug = row.get('スラッグ', '')
-        if pd.isna(raw_slug):
-            slug = ''
-        else:
-            slug = str(raw_slug).strip()
-            if slug in ['nan', 'None', '<NA>']:
-                slug = ''
+        slug = normalize_value(row.get('スラッグ', ''))
         
         # 現在のステータスを正規化
-        raw_current_status = row.get('修正・削除新規', '')
-        if pd.isna(raw_current_status):
-            current_status = ''
-        else:
-            current_status = str(raw_current_status).strip()
-            if current_status in ['nan', 'None', '<NA>']:
-                current_status = ''
+        current_status = normalize_value(row.get('修正・削除新規', ''))
         
         # すでに「修正」「削除」「新規追加」が入力されている場合は上書きしない
         if current_status in ['修正', '削除', '新規追加']:
@@ -2150,19 +2328,120 @@ def format_for_import(main_data, original_data):
     
     return formatted_data
 
-def create_import_files(formatted_data, user_data, municipality, target_month):
+def is_only_account_related_change(main_row, original_data):
+    """アカウント関連のみの変更かどうかを判定する関数
+    
+    Args:
+        main_row: メインデータの行
+        original_data: 差分検出用データ
+    
+    Returns:
+        bool: アカウント関連のみの変更の場合True
+    """
+    # スラッグの取得
+    slug = str(main_row.get('スラッグ', '')).strip()
+    
+    if not slug:
+        return False
+    
+    # 差分検出用データから同じスラッグの行を取得
+    original_row = original_data[original_data['スラッグ'] == slug]
+    
+    if original_row.empty:
+        return False
+    
+    original_row = original_row.iloc[0]
+    
+    # アカウント関連列
+    account_columns = ['ｱｶｳﾝﾄ発行有無', 'ｱｶｳﾝﾄ発行年月', 'アカウント発行の登録用メールアドレス']
+    
+    # アカウント関連以外の列で差分をチェック
+    excluded_columns = ['修正・削除新規'] + account_columns
+    check_columns = [col for col in main_row.index if col not in excluded_columns]
+    
+    # アカウント関連以外に変更があるかチェック
+    has_non_account_change = False
+    for col in check_columns:
+        if col in original_row.index:
+            main_value = normalize_value(main_row.get(col, ''))
+            original_value = normalize_value(original_row.get(col, ''))
+            
+            if main_value != original_value:
+                has_non_account_change = True
+                break
+    
+    # アカウント関連に変更があるかチェック
+    has_account_change = False
+    for col in account_columns:
+        if col in main_row.index and col in original_row.index:
+            main_value = normalize_value(main_row.get(col, ''))
+            original_value = normalize_value(original_row.get(col, ''))
+            
+            if main_value != original_value:
+                has_account_change = True
+                break
+    
+    # アカウント関連のみの変更の場合：アカウント関連に変更があり、かつアカウント関連以外に変更がない
+    return has_account_change and not has_non_account_change
+
+def detect_modified_columns(main_row, original_data, header_mapping):
+    """修正対象列を検出する関数（検証関数と同じロジックを使用）
+    
+    Args:
+        main_row: メインデータの行（整形前のデータ）
+        original_data: 差分検出用データ
+        header_mapping: ヘッダーマッピング辞書
+    
+    Returns:
+        str: 修正された列名のカンマ区切り文字列
+    """
+    # スラッグの取得（検証関数と同じ処理）
+    slug = str(main_row.get('スラッグ', '')).strip()
+    
+    if not slug:
+        return ''
+    
+    # 差分検出用データから同じスラッグの行を取得
+    original_row = original_data[original_data['スラッグ'] == slug]
+    
+    if original_row.empty:
+        return ''
+    
+    original_row = original_row.iloc[0]
+    modified_columns = []
+    
+    # 修正・削除新規列とアカウント関連列以外の列で差分をチェック（検証関数と同じロジック）
+    excluded_columns = ['修正・削除新規', 'ｱｶｳﾝﾄ発行有無', 'ｱｶｳﾝﾄ発行年月', 'アカウント発行の登録用メールアドレス']
+    check_columns = [col for col in main_row.index if col not in excluded_columns]
+    
+    for col in check_columns:
+        if col in original_row.index:
+            # normalize_value関数を使用して値を正規化（検証関数と同じ処理）
+            main_value = normalize_value(main_row.get(col, ''))
+            original_value = normalize_value(original_row.get(col, ''))
+            
+            if main_value != original_value:
+                # ヘッダーマッピングがある場合は変換後の名前を使用
+                display_col = header_mapping.get(col, col)
+                modified_columns.append(display_col)
+    
+    return ', '.join(modified_columns)
+
+def create_import_files(formatted_data, original_data, user_data, municipality, main_data=None):
     """インポートファイルの作成
     
     Args:
         formatted_data (pd.DataFrame): 整形済みデータ
+        original_data (pd.DataFrame): 差分検出用データ
         user_data (pd.DataFrame): ユーザーデータ
         municipality (str): 自治体名
-        target_month (int): 対象月
+        main_data (pd.DataFrame, optional): 整形前のメインデータ（修正対象列検出用）
     
     Returns:
         dict: 作成されたファイルの辞書
     """
     current_date = datetime.datetime.now().strftime("%Y%m%d")
+    current_month = datetime.datetime.now().month
     files = {}
     
     # 育児サークル用データのテンプレートヘッダー
@@ -2233,17 +2512,44 @@ def create_import_files(formatted_data, user_data, municipality, target_month):
             else:
                 new_circles_mapped[template_header] = ''
         
-        files[f"{municipality}育児サークル{target_month}月_新規_{current_date}.csv"] = new_circles_mapped
+        files[f"{municipality}育児サークル{current_month}月_新規_{current_date}.csv"] = new_circles_mapped
     
     # 修正の育児サークル（明示的に指定された行のみ）
     # 明示的に修正・削除・掲載順が指定されている行のみを修正CSVに含める
     # 暗黙的な修正検出は行わない（インポートデータ整形処理による変更を除外するため）
-    modified_circles = formatted_data[formatted_data['修正・削除新規'].isin(['修正', '削除', '掲載順'])]
+    # ただし、「修正」の場合はアカウント関連のみの変更は除外する
+    candidate_circles = formatted_data[formatted_data['修正・削除新規'].isin(['修正', '削除', '掲載順'])]
+    
+    # アカウント関連のみの変更を除外
+    modified_circles_list = []
+    for idx, row in candidate_circles.iterrows():
+        status = normalize_value(row.get('修正・削除新規', ''))
+        
+        if status == '修正':
+            # main_dataが提供されている場合、整形前のデータを使用してチェック
+            if main_data is not None and idx in main_data.index:
+                main_row = main_data.loc[idx]
+                # アカウント関連のみの変更の場合は除外
+                if is_only_account_related_change(main_row, original_data):
+                    continue
+            else:
+                # main_dataが提供されていない場合、formatted_dataを使用してチェック
+                if is_only_account_related_change(row, original_data):
+                    continue
+        
+        # 削除・掲載順の場合、またはアカウント関連以外の変更がある修正の場合は含める
+        modified_circles_list.append(idx)
+    
+    # インデックスリストから該当行を抽出
+    if modified_circles_list:
+        modified_circles = formatted_data.loc[modified_circles_list]
+    else:
+        modified_circles = pd.DataFrame()
     if not modified_circles.empty:
         # ヘッダーマッピング（CSVのヘッダーをテンプレートヘッダーに変換）
         # 事前にDataFrameの構造を定義（全て文字列型として初期化）
         modified_circles_mapped = pd.DataFrame(index=modified_circles.index, 
-                                             columns=circle_template_headers, 
+                                             columns=circle_template_headers + ['修正対象列'], 
                                              dtype=str)
         modified_circles_mapped = modified_circles_mapped.fillna('')
         
@@ -2268,68 +2574,45 @@ def create_import_files(formatted_data, user_data, municipality, target_month):
             else:
                 modified_circles_mapped[template_header] = ''
         
-        files[f"{municipality}育児サークル{target_month}月_修正_{current_date}.csv"] = modified_circles_mapped
+        # 修正対象列を検出して追加（整形前のデータを使用）
+        for idx, row in modified_circles.iterrows():
+            if main_data is not None and idx in main_data.index:
+                # 整形前のデータ（main_data）を使用して差分を検出
+                main_row = main_data.loc[idx]
+                modified_columns = detect_modified_columns(main_row, original_data, header_mapping)
+            else:
+                # main_dataが提供されていない場合は空文字列
+                modified_columns = ''
+            modified_circles_mapped.at[idx, '修正対象列'] = modified_columns
+        
+        # ダウンロード用のデータ（修正対象列を除外）
+        download_data = modified_circles_mapped.drop(columns=['修正対象列'])
+        
+        # ファイル辞書には表示用（修正対象列含む）とダウンロード用（修正対象列除外）の両方を保存
+        files[f"{municipality}育児サークル{current_month}月_修正_{current_date}.csv"] = {
+            'display_data': modified_circles_mapped,  # 表示用（修正対象列含む）
+            'download_data': download_data  # ダウンロード用（修正対象列除外）
+        }
     
     # ユーザー新規追加・修正の処理
-    user_import_data = create_user_import_data(formatted_data, user_data, target_month)
+    user_import_data = create_user_import_data(formatted_data, original_data, user_data)
     if not user_import_data.empty:
-        files[f"{municipality}{target_month}月_ユーザー登録{current_date}.csv"] = user_import_data
+        files[f"{municipality}{current_month}月_ユーザー登録{current_date}.csv"] = user_import_data
     
     return files
 
-def create_user_import_data(formatted_data, user_data, target_month):
+def create_user_import_data(formatted_data, original_data, user_data):
     """ユーザーインポートデータの作成
     
     Args:
         formatted_data (pd.DataFrame): 整形済みデータ
+        original_data (pd.DataFrame): 差分検出用データ
         user_data (pd.DataFrame): ユーザーデータ
-        target_month (int): 対象月
     
     Returns:
         pd.DataFrame: ユーザーインポートデータ
     """
     user_import_df = pd.DataFrame(columns=['名前', 'スラッグ', 'メールアドレス', '自己紹介', '種類', 'Webサイト', '画像'])
-    
-    # 変換できない値を収集するリスト
-    invalid_values = []
-    
-    # 和暦から西暦への変換関数
-    def convert_wareki_to_seireki(wareki_str):
-        if pd.isna(wareki_str):
-            return None
-        
-        # 文字列に変換して正規化
-        wareki_str = str(wareki_str).strip()
-        if not wareki_str or wareki_str in ['nan', 'None', '<NA>']:
-            return None
-            
-        try:
-            # カンマまたはピリオドで分割
-            separator = ',' if ',' in wareki_str else '.' if '.' in wareki_str else None
-            if separator:
-                parts = wareki_str.split(separator)
-                if len(parts) == 2:
-                    year_part = parts[0].strip()
-                    month_part = int(parts[1].strip())
-                    
-                    # 月の範囲チェック
-                    if not (1 <= month_part <= 12):
-                        return False  # 無効な月
-                    
-                    if year_part.startswith('R'):
-                        # 令和
-                        reiwa_year = int(year_part[1:])
-                        # 令和年の妥当性チェック（令和1年〜令和50年程度まで）
-                        if not (1 <= reiwa_year <= 50):
-                            return False  # 無効な令和年
-                        seireki_year = 2018 + reiwa_year
-                        return seireki_year * 100 + month_part
-            return False  # 変換できない形式
-        except:
-            return False  # 変換エラー
-    
-    # 新規追加のユーザーデータ作成
-    target_month_code = datetime.datetime.now().year * 100 + target_month
     
     # アカウント発行有無の条件を正規化して評価
     def is_account_issued(value):
@@ -2340,88 +2623,101 @@ def create_user_import_data(formatted_data, user_data, target_month):
             return False
         return value_str == '○'
     
-    # 変換できない値を収集しながら変換処理を実行
-    conversion_results = []
-    for idx, row in formatted_data.iterrows():
-        value = normalize_value(row.get('ｱｶｳﾝﾄ発行年月', ''))
-        if value:  # 空欄でない場合のみ変換を試行
-            conversion_result = convert_wareki_to_seireki(value)
-            if conversion_result is False:  # 変換できない場合
-                circle_name = row.get('サークル名', '不明')
-                if value not in [item['value'] for item in invalid_values]:
-                    invalid_values.append({
-                        'value': value,
-                        'circle_name': circle_name,
-                        'row_number': idx + 1
-                    })
-            conversion_results.append(conversion_result)
-        else:
-            conversion_results.append(None)
-    
-    # 変換できない値がある場合は警告情報をセッション状態に保存
-    if invalid_values:
-        warning_message = "### ⚠️ アカウント発行年月に変換できない値が見つかりました\n\n"
-        warning_message += "**正しい形式**: R6,4 または R6.4 （令和6年4月の場合）\n\n"
-        warning_message += "**変換できない値一覧**:\n"
+    # ｱｶｳﾝﾄ発行有無列の差分チェック関数
+    def has_account_status_changed(row, original_data):
+        """ｱｶｳﾝﾄ発行有無列の値が差分検出用データと異なるかチェック"""
+        main_slug = normalize_value(row.get('スラッグ', ''))
         
-        for item in invalid_values:
-            warning_message += f"- 行{item['row_number']}: 「{item['value']}」（サークル名: {item['circle_name']}）\n"
+        if main_slug:  # スラッグが存在する場合のみ処理
+            # 差分検出用データから同じスラッグの行を取得
+            original_row = original_data[original_data['スラッグ'] == main_slug]
+            
+            if not original_row.empty:
+                # ｱｶｳﾝﾄ発行有無の比較
+                main_account_status = is_account_issued(row.get('ｱｶｳﾝﾄ発行有無', ''))
+                original_account_status = is_account_issued(original_row.iloc[0].get('ｱｶｳﾝﾄ発行有無', ''))
+                
+                return main_account_status != original_account_status
         
-        warning_message += "\n**修正方法**:\n"
-        warning_message += "1. 年と月をカンマ（,）またはピリオド（.）で区切ってください\n"
-        warning_message += "2. 令和年は「R」で始めてください（例: R6,4）\n"
-        warning_message += "3. 月は1〜12の範囲で入力してください\n"
-        
-        # 警告メッセージをセッション状態に保存（重複を避けるため）
-        if 'account_date_warning' not in st.session_state:
-            st.session_state.account_date_warning = warning_message
+        return False
     
-    # 変換結果をDataFrameに追加して条件で絞り込み
-    formatted_data_with_conversion = formatted_data.copy()
-    formatted_data_with_conversion['_conversion_result'] = conversion_results
+    # 新規追加のユーザーデータ作成
+    # 条件を修正：
+    # 条件1（必須）: ｱｶｳﾝﾄ発行有無列 = '○' かつ アカウント発行の登録用メールアドレス列にメールアドレスが記載されている
+    # 条件2: 修正・削除新規列の値が「新規追加」である
+    # 条件3: ｱｶｳﾝﾄ発行有無列の値が差分検出用データと異なる
+    # 
+    # 作成されるパターン：
+    # - 条件1 かつ 条件2
+    # - 条件1 かつ 条件3
     
-    new_accounts = formatted_data_with_conversion[
-        formatted_data_with_conversion['ｱｶｳﾝﾄ発行有無'].apply(is_account_issued) &
-        (formatted_data_with_conversion['_conversion_result'] == target_month_code)
-    ]
+    # 条件1（必須）: ｱｶｳﾝﾄ発行有無列 = '○' かつ アカウント発行の登録用メールアドレス列にメールアドレスが記載されている
+    condition1 = (
+        formatted_data['ｱｶｳﾝﾄ発行有無'].apply(is_account_issued) &
+        formatted_data['アカウント発行の登録用メールアドレス'].apply(lambda x: normalize_value(x) != '')
+    )
+    
+    # 条件2: 修正・削除新規列の値が「新規追加」である
+    condition2 = formatted_data['修正・削除新規'].apply(lambda x: normalize_value(x) == '新規追加')
+    
+    # 条件3: ｱｶｳﾝﾄ発行有無列の値が差分検出用データと異なる
+    condition3 = formatted_data.apply(lambda row: has_account_status_changed(row, original_data), axis=1)
+    
+    # 条件1が必須で、かつ（条件2または条件3）を満たす行を抽出
+    new_accounts = formatted_data[condition1 & (condition2 | condition3)]
     
     # デバッグ情報をセッション状態に保存（表示は後で行う）
     if st.session_state.get('debug_mode', False):
         # アカウント発行有無の状況
         account_issued_count = formatted_data['ｱｶｳﾝﾄ発行有無'].apply(is_account_issued).sum()
         
-        # アカウント発行年月の状況
-        month_matches = formatted_data['ｱｶｳﾝﾄ発行年月'].apply(convert_wareki_to_seireki) == target_month_code
-        month_match_count = month_matches.sum()
+        # メールアドレス記載の状況
+        email_filled_count = formatted_data['アカウント発行の登録用メールアドレス'].apply(lambda x: normalize_value(x) != '').sum()
         
-        # アカウント発行年月の変換結果を詳細に記録
-        conversion_details = []
-        for idx, row in formatted_data.iterrows():
-            original_value = row.get('ｱｶｳﾝﾄ発行年月', '')
-            converted_value = convert_wareki_to_seireki(original_value)
-            conversion_details.append({
-                'サークル名': row.get('サークル名', ''),
-                '元の値': original_value,
-                '変換後': converted_value
-            })
+        # 新規追加ステータスの状況
+        new_status_count = condition2.sum()
         
-        conversion_df = pd.DataFrame(conversion_details)
+        # ｱｶｳﾝﾄ発行有無差分の状況
+        account_diff_count = condition3.sum()
         
         # デバッグ情報をセッション状態に保存
         debug_info = {
-            'target_month_code': target_month_code,
             'total_rows': len(formatted_data),
             'account_issued_count': account_issued_count,
-            'month_match_count': month_match_count,
+            'email_filled_count': email_filled_count,
+            'new_status_count': new_status_count,
+            'account_diff_count': account_diff_count,
+            'condition1_count': condition1.sum(),
+            'condition2_count': condition2.sum(),
+            'condition3_count': condition3.sum(),
             'new_accounts_count': len(new_accounts),
-            'new_accounts_sample': new_accounts[['サークル名', 'ｱｶｳﾝﾄ発行有無', 'ｱｶｳﾝﾄ発行年月', 'アカウント発行の登録用メールアドレス']].head() if len(new_accounts) > 0 else None,
+            'new_accounts_sample': new_accounts[['サークル名', 'ｱｶｳﾝﾄ発行有無', 'アカウント発行の登録用メールアドレス', '修正・削除新規']].head() if len(new_accounts) > 0 else None,
             'account_values': formatted_data['ｱｶｳﾝﾄ発行有無'].value_counts() if len(new_accounts) == 0 else None,
-            'month_values': formatted_data['ｱｶｳﾝﾄ発行年月'].apply(convert_wareki_to_seireki).value_counts() if len(new_accounts) == 0 else None,
-            'conversion_details': conversion_df
         }
         st.session_state.user_csv_debug_info = debug_info
     
-    if not new_accounts.empty:
+    # 修正のユーザーデータ作成（先に実行）
+    modified_users_df, modified_row_indices = create_modified_user_data(formatted_data, original_data, user_data)
+    
+    # 修正対象となった行を新規追加から除外
+    if modified_row_indices:
+        # 修正対象の行を除外したnew_accountsを作成
+        filtered_new_accounts = new_accounts[~new_accounts.index.isin(modified_row_indices)]
+    else:
+        # 修正対象がない場合は元のnew_accountsをそのまま使用
+        filtered_new_accounts = new_accounts
+    
+    # ユーザー作成時のエラー情報を収集
+    user_creation_errors = []
+    
+    # 既存のメールアドレスのセットを作成（高速化のため）
+    existing_emails = set(user_data['メールアドレス'].astype(str))
+    
+    # 同じバッチ内でのメールアドレス重複チェック用のセット
+    batch_emails = set()
+    
+    # 新規追加のユーザーデータ作成（修正対象を除外後）
+    if not filtered_new_accounts.empty:
         # 既存のスラッグから次の番号を取得
         existing_slugs = user_data['スラッグ'].astype(str)
         cs_numbers = []
@@ -2433,7 +2729,7 @@ def create_user_import_data(formatted_data, user_data, target_month):
         
         next_number = max(cs_numbers) + 1 if cs_numbers else 1
         
-        for idx, row in new_accounts.iterrows():
+        for idx, row in filtered_new_accounts.iterrows():
             # サークル名の正規化
             raw_circle_name = row.get('サークル名', '')
             if pd.isna(raw_circle_name):
@@ -2452,15 +2748,53 @@ def create_user_import_data(formatted_data, user_data, target_month):
                 if email in ['nan', 'None', '<NA>']:
                     email = ''
             
+            # ｱｶｳﾝﾄ発行有無の値を取得
+            account_issued = is_account_issued(row.get('ｱｶｳﾝﾄ発行有無', ''))
+            
+            # 修正・削除新規の値を取得
+            modification_status = normalize_value(row.get('修正・削除新規', ''))
+            
             # 必須項目のチェック
             if not circle_name or not email:
-                st.warning(f"行{idx+1}: サークル名またはメールアドレスが空のため、ユーザー作成をスキップします")
+                # 条件1を満たす対象者（ｱｶｳﾝﾄ発行有無=○かつメールアドレス記載予定）に対してのみエラー扱い
+                # ただし、既にfiltered_new_accountsで条件1を満たす行のみが抽出されているため、
+                # ここに来る行は全て条件1を満たす行である
+                missing_fields = []
+                if not circle_name:
+                    missing_fields.append('サークル名')
+                if not email:
+                    missing_fields.append('アカウント発行の登録用メールアドレス')
+                
+                user_creation_errors.append({
+                    '行番号': idx + 1,
+                    'サークル名': circle_name if circle_name else '（空欄）',
+                    'エラー内容': f"{', '.join(missing_fields)}が空欄です",
+                    'エラー種別': '必須項目不足'
+                })
                 continue
             
-            # メールアドレスの重複チェック
-            if email in user_data['メールアドレス'].values:
-                st.error(f"メールアドレス '{email}' は既に登録されています（サークル名: {circle_name}）")
+            # メールアドレスの重複チェック（既存ユーザーデータとの重複）
+            if email in existing_emails:
+                user_creation_errors.append({
+                    '行番号': idx + 1,
+                    'サークル名': circle_name,
+                    'エラー内容': f"メールアドレス '{email}' は既に登録されています",
+                    'エラー種別': 'メールアドレス重複'
+                })
                 continue
+            
+            # メールアドレスの重複チェック（同じバッチ内での重複）
+            if email in batch_emails:
+                user_creation_errors.append({
+                    '行番号': idx + 1,
+                    'サークル名': circle_name,
+                    'エラー内容': f"メールアドレス '{email}' は同じファイル内の他の行と重複しています",
+                    'エラー種別': 'メールアドレス重複'
+                })
+                continue
+            
+            # 処理済みメールアドレスとして記録
+            batch_emails.add(email)
             
             new_slug = f"cs{next_number:04d}"
             
@@ -2477,10 +2811,141 @@ def create_user_import_data(formatted_data, user_data, target_month):
             user_import_df = pd.concat([user_import_df, pd.DataFrame([new_user])], ignore_index=True)
             next_number += 1
     
-    # 修正のユーザーデータ作成（実装は次のステップで完成予定）
-    # TODO: アカウント発行有無列の差分チェックと既存ユーザーの更新
+    # ユーザー作成エラーがある場合は警告情報をセッション状態に保存
+    if user_creation_errors:
+        error_warning = "### ⚠️ ユーザー作成時にエラーが発生しました\n\n"
+        error_warning += f"**{len(user_creation_errors)}件のエラーが見つかりました。以下の行でユーザーが作成されませんでした：**\n\n"
+        
+        # エラー種別ごとに分類
+        missing_fields_errors = [e for e in user_creation_errors if e['エラー種別'] == '必須項目不足']
+        duplicate_email_errors = [e for e in user_creation_errors if e['エラー種別'] == 'メールアドレス重複']
+        
+        if missing_fields_errors:
+            error_warning += "**📝 必須項目不足:**\n"
+            for error in missing_fields_errors:
+                error_warning += f"- 行{error['行番号']}: {error['サークル名']} - {error['エラー内容']}\n"
+            error_warning += "\n"
+        
+        if duplicate_email_errors:
+            error_warning += "**📧 メールアドレス重複:**\n"
+            for error in duplicate_email_errors:
+                error_warning += f"- 行{error['行番号']}: {error['サークル名']} - {error['エラー内容']}\n"
+            error_warning += "\n"
+        
+        error_warning += "**対処方法:**\n"
+        error_warning += "1. 必須項目不足：サークル名とアカウント発行の登録用メールアドレスを入力してください\n"
+        error_warning += "2. メールアドレス重複：既存と異なるメールアドレスを使用するか、既存ユーザーの修正を検討してください\n"
+        error_warning += "3. 同じファイル内での重複：重複するメールアドレスを修正してください\n"
+        
+        # 警告メッセージをセッション状態に保存
+        if 'user_creation_warning' not in st.session_state:
+            st.session_state.user_creation_warning = error_warning
+    
+    # 新規と修正をマージ
+    if not modified_users_df.empty:
+        user_import_df = pd.concat([user_import_df, modified_users_df], ignore_index=True)
     
     return user_import_df
+
+def create_modified_user_data(main_data, original_data, user_data):
+    """ユーザー修正データの作成
+    
+    Args:
+        main_data (pd.DataFrame): メインデータ
+        original_data (pd.DataFrame): 差分検出用データ
+        user_data (pd.DataFrame): ユーザーデータ
+    
+    Returns:
+        tuple: (修正されたユーザーデータ, 修正対象行のインデックスリスト)
+    """
+    modified_users_df = pd.DataFrame(columns=['名前', 'スラッグ', 'メールアドレス', '自己紹介', '種類', 'Webサイト', '画像'])
+    
+    # 差分表示用のリスト
+    modification_details = []
+    
+    # 修正対象行のインデックスを記録
+    modified_row_indices = []
+    
+    # 1. メインデータのアカウント発行の登録用メールアドレス列の値が差分検出用データと異なる行を抽出
+    email_changed_rows = []
+    
+    for idx, main_row in main_data.iterrows():
+        # スラッグでマッチング
+        main_slug = normalize_value(main_row.get('スラッグ', ''))
+        
+        if main_slug:  # スラッグが存在する場合のみ処理
+            # 差分検出用データから同じスラッグの行を取得
+            original_row = original_data[original_data['スラッグ'] == main_slug]
+            
+            if not original_row.empty:
+                # メールアドレスの比較
+                main_email = normalize_value(main_row.get('アカウント発行の登録用メールアドレス', ''))
+                original_email = normalize_value(original_row.iloc[0].get('アカウント発行の登録用メールアドレス', ''))
+                
+                if main_email != original_email:
+                    email_changed_rows.append({
+                        'index': idx,
+                        'main_row': main_row,
+                        'main_email': main_email,
+                        'original_email': original_email
+                    })
+    
+    # 2. 抽出したデータのうち、「代表者」列の値がユーザーデータの「スラッグ」列と一致するデータを探す
+    for change_info in email_changed_rows:
+        main_row = change_info['main_row']
+        representative_slug = normalize_value(main_row.get('代表者', ''))
+        
+        if representative_slug:  # 代表者スラッグが存在する場合
+            # ユーザーデータから一致するスラッグを探す
+            matching_user = user_data[user_data['スラッグ'] == representative_slug]
+            
+            if not matching_user.empty:
+                # 3. 一致するユーザーデータの「名前」「メールアドレス」を更新
+                user_row = matching_user.iloc[0]
+                
+                # メインデータから新しい値を取得
+                new_name = normalize_value(main_row.get('サークル名', ''))
+                new_email = change_info['main_email']
+                
+                # 現在のユーザー情報を取得
+                current_name = normalize_value(user_row.get('名前', ''))
+                current_email = normalize_value(user_row.get('メールアドレス', ''))
+                
+                # 実際に変更があるかチェック
+                name_changed = new_name != current_name
+                email_changed = new_email != current_email
+                
+                if name_changed or email_changed:
+                    # 修正されたユーザーデータを作成
+                    modified_user = {
+                        '名前': new_name if new_name else current_name,
+                        'スラッグ': representative_slug,
+                        'メールアドレス': new_email if new_email else current_email,
+                        '自己紹介': normalize_value(user_row.get('自己紹介', '')),
+                        '種類': normalize_value(user_row.get('種類', '')),
+                        'Webサイト': normalize_value(user_row.get('Webサイト', '')),
+                        '画像': normalize_value(user_row.get('画像', ''))
+                    }
+                    
+                    modified_users_df = pd.concat([modified_users_df, pd.DataFrame([modified_user])], ignore_index=True)
+                    
+                    # 修正対象行のインデックスを記録
+                    modified_row_indices.append(change_info['index'])
+                    
+                    # 差分表示用の情報を記録
+                    modification_details.append({
+                        'サークル名': new_name,
+                        'ユーザースラッグ': representative_slug,
+                        '名前変更': f"「{current_name}」→「{new_name}」" if name_changed else "変更なし",
+                        'メールアドレス変更': f"「{current_email}」→「{new_email}」" if email_changed else "変更なし",
+                        '変更理由': 'アカウント発行の登録用メールアドレス列の差分検出'
+                    })
+    
+    # 差分を画面表示（Streamlitのセッション状態に保存）
+    if modification_details:
+        st.session_state.user_modification_details = modification_details
+    
+    return modified_users_df, modified_row_indices
 
 def main():
     initialize_session_state()
@@ -2492,7 +2957,7 @@ def main():
         
         # バージョン情報（控えめに表示）
         st.markdown("---")
-        st.caption("v1.1 - 2025/01/25")
+        st.caption("v2.0 - 2025/07/03")
     
     st.title("育児サークル情報処理アプリ")
     
