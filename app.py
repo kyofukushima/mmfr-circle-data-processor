@@ -748,6 +748,10 @@ def reset_import_session_state():
     # ユーザー修正情報もクリア
     if 'user_modification_details' in st.session_state:
         del st.session_state.user_modification_details
+    
+    # 統合ユーザー情報もクリア
+    if 'user_comprehensive_details' in st.session_state:
+        del st.session_state.user_comprehensive_details
 
 def check_file_changed(file, file_type):
     """ファイルが変更されたかチェックし、変更された場合のみセッション状態をリセット
@@ -2126,14 +2130,36 @@ def show_import_data_page():
                             # 警告を表示したらセッション状態から削除（重複表示を防ぐ）
                             del st.session_state.user_creation_warning
                         
-                        # ユーザー修正の差分表示
-                        if 'user_modification_details' in st.session_state:
-                            st.info("### 👤 ユーザー情報の修正内容")
-                            modification_df = pd.DataFrame(st.session_state.user_modification_details)
-                            st.dataframe(modification_df, use_container_width=True, hide_index=True)
-                            st.caption("上記のユーザー情報が修正されます。内容を確認してからダウンロードしてください。")
+                        # ユーザー情報の統合表示（修正と新規追加の両方）
+                        if 'user_comprehensive_details' in st.session_state:
+                            comprehensive_df = pd.DataFrame(st.session_state.user_comprehensive_details)
+                            
+                            # 処理種別でグループ化
+                            modification_data = comprehensive_df[comprehensive_df['処理種別'] == '修正']
+                            new_addition_data = comprehensive_df[comprehensive_df['処理種別'] == '新規追加']
+                            total_count = len(comprehensive_df)
+                            
+                            with st.expander(f"👤 ユーザー情報の処理内容を確認する ({total_count}件)"):
+                                if not modification_data.empty:
+                                    st.markdown("#### 🔄 修正されるユーザー")
+                                    st.dataframe(modification_data, use_container_width=True, hide_index=True)
+                                    st.caption(f"💡 修正対象: {len(modification_data)}件のユーザー")
+                                
+                                if not new_addition_data.empty:
+                                    st.markdown("#### ➕ 新規追加されるユーザー")
+                                    st.dataframe(new_addition_data, use_container_width=True, hide_index=True)
+                                    st.caption(f"💡 新規追加: {len(new_addition_data)}件のユーザー")
+                                
+                                # 総計表示
+                                st.caption(f"📊 **合計: {total_count}件のユーザー処理** (修正: {len(modification_data)}件, 新規追加: {len(new_addition_data)}件)")
+                                st.caption("⚠️ 上記のユーザー情報が処理されます。内容を確認してからダウンロードしてください。")
+                            
                             # 表示したらセッション状態から削除（重複表示を防ぐ）
-                            del st.session_state.user_modification_details
+                            del st.session_state.user_comprehensive_details
+                            
+                            # 古い形式の修正詳細情報も削除（統合表示に移行したため）
+                            if 'user_modification_details' in st.session_state:
+                                del st.session_state.user_modification_details
                         
                         # 削除対象データの表示
                         deletion_data = formatted_data[formatted_data['修正・削除新規'] == '削除']
@@ -2707,6 +2733,9 @@ def create_user_import_data(formatted_data, original_data, user_data):
         # 修正対象がない場合は元のnew_accountsをそのまま使用
         filtered_new_accounts = new_accounts
     
+    # 新規追加ユーザー情報の詳細を収集（表示用）
+    new_user_details = []
+    
     # ユーザー作成時のエラー情報を収集
     user_creation_errors = []
     
@@ -2808,6 +2837,15 @@ def create_user_import_data(formatted_data, original_data, user_data):
                 '画像': ''
             }
             
+            # 新規追加ユーザー詳細情報を収集
+            new_user_details.append({
+                'サークル名': circle_name,
+                'ユーザースラッグ': new_slug,
+                'メールアドレス': email,
+                '処理種別': '新規追加',
+                '作成理由': f"修正・削除新規: {modification_status}" if modification_status == '新規追加' else 'アカウント発行有無の差分検出'
+            })
+            
             user_import_df = pd.concat([user_import_df, pd.DataFrame([new_user])], ignore_index=True)
             next_number += 1
     
@@ -2844,6 +2882,41 @@ def create_user_import_data(formatted_data, original_data, user_data):
     # 新規と修正をマージ
     if not modified_users_df.empty:
         user_import_df = pd.concat([user_import_df, modified_users_df], ignore_index=True)
+    
+    # 統合ユーザー情報をセッション状態に保存（新規追加と修正の両方）
+    all_user_details = []
+    
+    # 修正情報を追加（既存のuser_modification_detailsから取得）
+    if 'user_modification_details' in st.session_state:
+        for detail in st.session_state.user_modification_details:
+            # 修正情報を統合フォーマットに変換
+            changes = []
+            if detail['名前変更'] != "変更なし":
+                changes.append(f"名前: {detail['名前変更']}")
+            if detail['メールアドレス変更'] != "変更なし":
+                changes.append(f"メールアドレス: {detail['メールアドレス変更']}")
+            
+            all_user_details.append({
+                'サークル名': detail['サークル名'],
+                'ユーザースラッグ': detail['ユーザースラッグ'],
+                '処理種別': '修正',
+                '変更内容': ', '.join(changes) if changes else '変更なし',
+                '処理理由': detail['変更理由']
+            })
+    
+    # 新規追加情報を追加
+    for detail in new_user_details:
+        all_user_details.append({
+            'サークル名': detail['サークル名'],
+            'ユーザースラッグ': detail['ユーザースラッグ'],
+            '処理種別': detail['処理種別'],
+            '変更内容': f"新規作成 (メールアドレス: {detail['メールアドレス']})",
+            '処理理由': detail['作成理由']
+        })
+    
+    # 統合情報をセッション状態に保存
+    if all_user_details:
+        st.session_state.user_comprehensive_details = all_user_details
     
     return user_import_df
 
