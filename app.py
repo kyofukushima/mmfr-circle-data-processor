@@ -92,6 +92,7 @@ def add_location_column(circle_data,df_f):
     Returns:
         tuple: (処理後のデータフレーム, 処理内容のデータフレーム)
     """
+    # 場所情報の追加（施設情報データは既に検証済み）
     circle_data['場所'] = circle_data['活動場所'].map(df_f.set_index('施設名')['場所'])
     
     # 処理内容のデータフレームを作成
@@ -116,31 +117,49 @@ def check_data_consistency(circle_data, last_month_data):
     Raises:
         st.stop(): データの不一致がある場合に処理を停止
     """
+    error_messages = []
+    
+    # 必要な列の存在チェック
+    required_columns = ['スラッグ', 'サークル名']
+    
+    for col in required_columns:
+        if col not in circle_data.columns:
+            error_messages.append(f"### 育児サークルデータに「{col}」列が存在しません")
+        if col not in last_month_data.columns:
+            error_messages.append(f"### 先月分データに「{col}」列が存在しません")
+    
+    if error_messages:
+        st.error('\n'.join(error_messages))
+        st.stop()
+    
     # スラッグの重複チェック
     circle_duplicates = circle_data[circle_data['スラッグ'].duplicated()]['スラッグ'].unique()
     last_month_duplicates = last_month_data[last_month_data['スラッグ'].duplicated()]['スラッグ'].unique()
     
-    error_messages = []
-    
     if len(circle_duplicates) > 0:
         error_messages.append("### 育児サークルデータ内で重複しているスラッグ:")
         for slug in circle_duplicates:
-            circle_names = circle_data[circle_data['スラッグ'] == slug]['サークル名'].tolist()
+            duplicate_rows = circle_data[circle_data['スラッグ'] == slug]
             error_messages.append(f"- スラッグ: {slug}")
-            for name in circle_names:
-                error_messages.append(f"  - サークル名: {name}")
+            for idx, row in duplicate_rows.iterrows():
+                circle_name = row.get('サークル名', '不明')
+                error_messages.append(f"  - 行{idx+1}: {circle_name}")
     
     if len(last_month_duplicates) > 0:
         error_messages.append("\n### 先月分データ内で重複しているスラッグ:")
         for slug in last_month_duplicates:
-            circle_names = last_month_data[last_month_data['スラッグ'] == slug]['サークル名'].tolist()
+            duplicate_rows = last_month_data[last_month_data['スラッグ'] == slug]
             error_messages.append(f"- スラッグ: {slug}")
-            for name in circle_names:
-                error_messages.append(f"  - サークル名: {name}")
+            for idx, row in duplicate_rows.iterrows():
+                circle_name = row.get('サークル名', '不明')
+                error_messages.append(f"  - 行{idx+1}: {circle_name}")
     
-    # スラッグの存在チェック
-    circle_slugs = set(circle_data['スラッグ'])
-    last_month_slugs = set(last_month_data['スラッグ'])
+    # スラッグの存在チェック（空欄・欠損値を除外）
+    circle_slugs = set(circle_data['スラッグ'].dropna().astype(str))
+    circle_slugs = {slug for slug in circle_slugs if slug.strip() and slug not in ['nan', 'None', '<NA>']}
+    
+    last_month_slugs = set(last_month_data['スラッグ'].dropna().astype(str))
+    last_month_slugs = {slug for slug in last_month_slugs if slug.strip() and slug not in ['nan', 'None', '<NA>']}
     
     # 育児サークルデータにのみ存在するスラッグ
     only_in_circle = circle_slugs - last_month_slugs
@@ -150,14 +169,18 @@ def check_data_consistency(circle_data, last_month_data):
     if only_in_circle:
         error_messages.append("\n### 先月分データに存在しないスラッグ:")
         for slug in only_in_circle:
-            circle_name = circle_data[circle_data['スラッグ'] == slug]['サークル名'].iloc[0]
-            error_messages.append(f"- スラッグ: {slug} (サークル名: {circle_name})")
+            matching_rows = circle_data[circle_data['スラッグ'] == slug]
+            if not matching_rows.empty:
+                circle_name = matching_rows['サークル名'].iloc[0]
+                error_messages.append(f"- スラッグ: {slug} (サークル名: {circle_name})")
     
     if only_in_last_month:
         error_messages.append("\n### 育児サークルデータに存在しないスラッグ:")
         for slug in only_in_last_month:
-            circle_name = last_month_data[last_month_data['スラッグ'] == slug]['サークル名'].iloc[0]
-            error_messages.append(f"- スラッグ: {slug} (サークル名: {circle_name})")
+            matching_rows = last_month_data[last_month_data['スラッグ'] == slug]
+            if not matching_rows.empty:
+                circle_name = matching_rows['サークル名'].iloc[0]
+                error_messages.append(f"- スラッグ: {slug} (サークル名: {circle_name})")
     
     if error_messages:
         st.error("""
@@ -184,18 +207,47 @@ def add_account_columns(circle_data, last_month_data):
     account_columns = ['ｱｶｳﾝﾄ発行有無', 'ｱｶｳﾝﾄ発行年月', 'アカウント発行の登録用メールアドレス']
     
     try:
+        # 先月分データのスラッグ列の重複チェック
+        if 'スラッグ' not in last_month_data.columns:
+            st.error("先月分データに「スラッグ」列が存在しません。")
+            st.stop()
+        
+        # スラッグの重複チェック
+        slug_duplicates = last_month_data[last_month_data['スラッグ'].duplicated()]['スラッグ'].unique()
+        if len(slug_duplicates) > 0:
+            error_message = "### 先月分データ内で重複しているスラッグが検出されました:\n"
+            for slug in slug_duplicates:
+                duplicate_rows = last_month_data[last_month_data['スラッグ'] == slug]
+                error_message += f"- スラッグ: {slug}\n"
+                for idx, row in duplicate_rows.iterrows():
+                    circle_name = row.get('サークル名', '不明')
+                    error_message += f"  - 行{idx+1}: {circle_name}\n"
+            
+            error_message += "\n※ 先月分データのスラッグ重複を修正してから再度実行してください。"
+            st.error(error_message)
+            st.stop()
+        
+        # 必要な列の存在チェック
+        missing_columns = [col for col in account_columns if col not in last_month_data.columns]
+        if missing_columns:
+            st.error(f"先月分データに以下の列が存在しません: {', '.join(missing_columns)}")
+            st.stop()
+        
+        # アカウント情報の追加
         for col in account_columns:
             # スラッグをキーとしてマッピング
             mapping_dict = last_month_data.set_index('スラッグ')[col].to_dict()
             circle_data[col] = circle_data['スラッグ'].map(mapping_dict)
+            
     except Exception as e:
         st.error(f"""
         アカウント情報の追加中にエラーが発生しました。
         エラー内容: {str(e)}
         
         以下を確認してください：
-        1. スラッグに重複がないこと
+        1. 先月分データのスラッグに重複がないこと
         2. 必要な列（{', '.join(account_columns)}）が先月分データに存在すること
+        3. データの形式が正しいこと
         """)
         st.stop()
     
@@ -745,6 +797,10 @@ def reset_import_session_state():
     if 'user_creation_warning' in st.session_state:
         del st.session_state.user_creation_warning
     
+    # ユーザー修正警告もクリア
+    if 'user_modification_warning' in st.session_state:
+        del st.session_state.user_modification_warning
+    
     # ユーザー修正情報もクリア
     if 'user_modification_details' in st.session_state:
         del st.session_state.user_modification_details
@@ -858,8 +914,8 @@ def show_modification_excel_page():
     facility_csv_file = st.file_uploader("施設情報CSVファイルを選択してください", type=['csv'])
     if facility_csv_file:
         try:
-            # 施設情報CSVファイルの検証と読み込み
-            facility_data, facility_encoding, facility_debug_info = validate_csv_file(facility_csv_file)
+            # 施設情報CSVファイルの検証と読み込み（専用の検証関数を使用）
+            facility_data, facility_encoding, facility_debug_info = validate_facility_csv_file(facility_csv_file)
             st.success("施設情報CSVファイルが正常に読み込まれました")
             with st.expander("施設情報データを確認する"):
                 st.dataframe(facility_data, use_container_width=True)
@@ -1877,8 +1933,8 @@ def show_import_data_page():
             if check_file_changed(facility_csv_file, 'facility'):
                 reset_import_session_state()
             
-            # 施設情報CSVファイルの検証と読み込み
-            facility_data, facility_encoding, facility_debug_info = validate_csv_file(facility_csv_file)
+            # 施設情報CSVファイルの検証と読み込み（専用の検証関数を使用）
+            facility_data, facility_encoding, facility_debug_info = validate_facility_csv_file(facility_csv_file)
             
             st.success(f"施設情報CSVファイルが正常に読み込まれました（エンコーディング: {facility_encoding}）")
             with st.expander("施設情報データを確認する"):
@@ -2129,6 +2185,12 @@ def show_import_data_page():
                             st.warning(st.session_state.user_creation_warning)
                             # 警告を表示したらセッション状態から削除（重複表示を防ぐ）
                             del st.session_state.user_creation_warning
+                        
+                        # ユーザー修正の警告メッセージがある場合は表示
+                        if 'user_modification_warning' in st.session_state:
+                            st.warning(st.session_state.user_modification_warning)
+                            # 警告を表示したらセッション状態から削除（重複表示を防ぐ）
+                            del st.session_state.user_modification_warning
                         
                         # ユーザー情報の統合表示（修正と新規追加の両方）
                         if 'user_comprehensive_details' in st.session_state:
@@ -2651,7 +2713,18 @@ def create_user_import_data(formatted_data, original_data, user_data):
     
     # ｱｶｳﾝﾄ発行有無列の差分チェック関数
     def has_account_status_changed(row, original_data):
-        """ｱｶｳﾝﾄ発行有無列の値が差分検出用データと異なるかチェック"""
+        """ｱｶｳﾝﾄ発行有無列の値が差分検出用データと異なるかチェック
+        
+        Returns:
+            bool: 以下のパターンで返り値が決まる
+                - True: スラッグが存在し、かつｱｶｳﾝﾄ発行有無の値が差分検出用データと異なる場合
+                  例: メインデータ「○」→差分検出用データ「空欄」（新規でアカウント発行）
+                  例: メインデータ「空欄」→差分検出用データ「○」（アカウント発行取り消し）
+                - False: 以下のいずれかの場合
+                  1. スラッグが空欄または存在しない場合
+                  2. 差分検出用データに該当スラッグが見つからない場合
+                  3. ｱｶｳﾝﾄ発行有無の値が差分検出用データと同じ場合
+        """
         main_slug = normalize_value(row.get('スラッグ', ''))
         
         if main_slug:  # スラッグが存在する場合のみ処理
@@ -2802,28 +2875,59 @@ def create_user_import_data(formatted_data, original_data, user_data):
                 })
                 continue
             
-            # メールアドレスの重複チェック（既存ユーザーデータとの重複）
-            if email in existing_emails:
-                user_creation_errors.append({
-                    '行番号': idx + 1,
-                    'サークル名': circle_name,
-                    'エラー内容': f"メールアドレス '{email}' は既に登録されています",
-                    'エラー種別': 'メールアドレス重複'
-                })
-                continue
+            # ステータス列による処理分岐
+            if modification_status == '新規追加':
+                # 新規追加の場合：既存ユーザーとのメールアドレス重複チェック
+                if email in existing_emails:
+                    user_creation_errors.append({
+                        '行番号': idx + 1,
+                        'サークル名': circle_name,
+                        'エラー内容': f"メールアドレス '{email}' は既に登録されています",
+                        'エラー種別': 'メールアドレス重複'
+                    })
+                    continue
+                
+                # 同じバッチ内でのメールアドレス重複チェック
+                if email in batch_emails:
+                    user_creation_errors.append({
+                        '行番号': idx + 1,
+                        'サークル名': circle_name,
+                        'エラー内容': f"メールアドレス '{email}' は同じファイル内の他の行と重複しています",
+                        'エラー種別': 'メールアドレス重複'
+                    })
+                    continue
+            else:
+                # 新規追加以外の場合：スラッグで紐づいたユーザーとの差分チェック
+                slug = normalize_value(row.get('スラッグ', ''))
+                if slug:
+                    # 代表者スラッグを取得
+                    representative_slug = normalize_value(row.get('代表者', ''))
+                    if representative_slug:
+                        # 既存ユーザーデータから該当ユーザーを検索
+                        existing_user = user_data[user_data['スラッグ'] == representative_slug]
+                        if not existing_user.empty:
+                            existing_user_row = existing_user.iloc[0]
+                            existing_user_name = normalize_value(existing_user_row.get('名前', ''))
+                            existing_user_email = normalize_value(existing_user_row.get('メールアドレス', ''))
+                            
+                            # サークル名とメールアドレスの差分チェック
+                            name_diff = circle_name != existing_user_name
+                            email_diff = email != existing_user_email
+                            
+                            if not name_diff and not email_diff:
+                                # 差分がない場合：「すでに発行されています」エラー
+                                user_creation_errors.append({
+                                    '行番号': idx + 1,
+                                    'サークル名': circle_name,
+                                    'エラー内容': f"ユーザー '{representative_slug}' はすでに発行されています（名前: {existing_user_name}, メールアドレス: {existing_user_email}）",
+                                    'エラー種別': 'すでに発行済み'
+                                })
+                                continue
+                            # 差分がある場合はエラーとせず、メインデータを正として処理を継続
             
-            # メールアドレスの重複チェック（同じバッチ内での重複）
-            if email in batch_emails:
-                user_creation_errors.append({
-                    '行番号': idx + 1,
-                    'サークル名': circle_name,
-                    'エラー内容': f"メールアドレス '{email}' は同じファイル内の他の行と重複しています",
-                    'エラー種別': 'メールアドレス重複'
-                })
-                continue
-            
-            # 処理済みメールアドレスとして記録
-            batch_emails.add(email)
+            # 処理済みメールアドレスとして記録（新規追加の場合のみ）
+            if modification_status == '新規追加':
+                batch_emails.add(email)
             
             new_slug = f"cs{next_number:04d}"
             
@@ -2857,6 +2961,7 @@ def create_user_import_data(formatted_data, original_data, user_data):
         # エラー種別ごとに分類
         missing_fields_errors = [e for e in user_creation_errors if e['エラー種別'] == '必須項目不足']
         duplicate_email_errors = [e for e in user_creation_errors if e['エラー種別'] == 'メールアドレス重複']
+        already_issued_errors = [e for e in user_creation_errors if e['エラー種別'] == 'すでに発行済み']
         
         if missing_fields_errors:
             error_warning += "**📝 必須項目不足:**\n"
@@ -2870,10 +2975,17 @@ def create_user_import_data(formatted_data, original_data, user_data):
                 error_warning += f"- 行{error['行番号']}: {error['サークル名']} - {error['エラー内容']}\n"
             error_warning += "\n"
         
+        if already_issued_errors:
+            error_warning += "**✅ すでに発行済み:**\n"
+            for error in already_issued_errors:
+                error_warning += f"- 行{error['行番号']}: {error['サークル名']} - {error['エラー内容']}\n"
+            error_warning += "\n"
+        
         error_warning += "**対処方法:**\n"
         error_warning += "1. 必須項目不足：サークル名とアカウント発行の登録用メールアドレスを入力してください\n"
         error_warning += "2. メールアドレス重複：既存と異なるメールアドレスを使用するか、既存ユーザーの修正を検討してください\n"
         error_warning += "3. 同じファイル内での重複：重複するメールアドレスを修正してください\n"
+        error_warning += "4. すでに発行済み：該当ユーザーは既に発行されています。差分がある場合は修正処理として処理されます\n"
         
         # 警告メッセージをセッション状態に保存
         if 'user_creation_warning' not in st.session_state:
@@ -2939,6 +3051,9 @@ def create_modified_user_data(main_data, original_data, user_data):
     # 修正対象行のインデックスを記録
     modified_row_indices = []
     
+    # ユーザー修正時のエラー情報を収集
+    user_modification_errors = []
+    
     # 1. メインデータのアカウント発行の登録用メールアドレス列の値が差分検出用データと異なる行を抽出
     email_changed_rows = []
     
@@ -2989,6 +3104,25 @@ def create_modified_user_data(main_data, original_data, user_data):
                 email_changed = new_email != current_email
                 
                 if name_changed or email_changed:
+                    # メールアドレス重複チェック（自分以外のユーザーとの重複）
+                    if email_changed and new_email:
+                        # 自分以外のユーザーで同じメールアドレスを持つユーザーがいるかチェック
+                        other_users_with_same_email = user_data[
+                            (user_data['メールアドレス'] == new_email) & 
+                            (user_data['スラッグ'] != representative_slug)
+                        ]
+                        
+                        if not other_users_with_same_email.empty:
+                            # メールアドレス重複エラーを記録
+                            user_modification_errors.append({
+                                '行番号': change_info['index'] + 1,
+                                'サークル名': new_name,
+                                'ユーザースラッグ': representative_slug,
+                                'エラー内容': f"メールアドレス '{new_email}' は他のユーザー（{other_users_with_same_email.iloc[0]['スラッグ']}）が既に使用しています",
+                                'エラー種別': 'メールアドレス重複'
+                            })
+                            continue  # この修正をスキップ
+                    
                     # 修正されたユーザーデータを作成
                     modified_user = {
                         '名前': new_name if new_name else current_name,
@@ -3014,11 +3148,114 @@ def create_modified_user_data(main_data, original_data, user_data):
                         '変更理由': 'アカウント発行の登録用メールアドレス列の差分検出'
                     })
     
+    # ユーザー修正エラーがある場合は警告情報をセッション状態に保存
+    if user_modification_errors:
+        error_warning = "### ⚠️ ユーザー修正時にメールアドレス重複エラーが発生しました\n\n"
+        error_warning += f"**{len(user_modification_errors)}件のエラーが見つかりました。以下の修正がスキップされました：**\n\n"
+        
+        for error in user_modification_errors:
+            error_warning += f"- 行{error['行番号']}: {error['サークル名']} (ユーザー: {error['ユーザースラッグ']})\n"
+            error_warning += f"  - {error['エラー内容']}\n"
+        
+        error_warning += "\n**対処方法:**\n"
+        error_warning += "1. 重複するメールアドレスを修正してください\n"
+        error_warning += "2. または、既存ユーザーのメールアドレスを変更してください\n"
+        
+        # 警告メッセージをセッション状態に保存
+        if 'user_modification_warning' not in st.session_state:
+            st.session_state.user_modification_warning = error_warning
+    
     # 差分を画面表示（Streamlitのセッション状態に保存）
     if modification_details:
         st.session_state.user_modification_details = modification_details
     
     return modified_users_df, modified_row_indices
+
+def validate_facility_csv_file(csv_file):
+    """施設情報CSVファイルの検証と読み込みを行う
+    
+    Args:
+        csv_file: アップロードされた施設情報CSVファイル
+    
+    Returns:
+        tuple: (データフレーム, エンコーディング, デバッグ情報)
+    
+    Raises:
+        ValueError: 検証エラーが発生した場合
+    """
+    # 基本的なCSV検証
+    facility_data, encoding, debug_info = validate_csv_file(csv_file)
+    
+    # 施設情報専用の検証
+    try:
+        # 必要な列の存在チェック
+        required_columns = ['施設名', '場所']
+        missing_columns = [col for col in required_columns if col not in facility_data.columns]
+        if missing_columns:
+            raise ValueError(f"施設情報データに以下の列が存在しません: {', '.join(missing_columns)}")
+        
+        # 施設名の重複チェック
+        # NaN値も含めて重複をチェックするため、文字列に変換してから処理
+        facility_data_str = facility_data.copy()
+        facility_data_str['施設名_str'] = facility_data_str['施設名'].fillna('').astype(str)
+        
+        # 重複している施設名を検出
+        duplicated_mask = facility_data_str['施設名_str'].duplicated(keep=False)
+        duplicate_counts = facility_data_str['施設名_str'].value_counts()
+        
+        # 2回以上出現する施設名を取得
+        facility_duplicates = duplicate_counts[duplicate_counts > 1].index.tolist()
+        
+        if len(facility_duplicates) > 0:
+            error_message = "施設情報データ内で重複している施設名が検出されました:\n\n"
+            for facility_name_str in facility_duplicates:
+                # 重複している施設名のすべての行を取得
+                if facility_name_str == '':
+                    # 空欄・NaN値の場合
+                    all_duplicate_rows = facility_data_str[facility_data_str['施設名_str'] == '']
+                    display_name = "（空欄）"
+                else:
+                    all_duplicate_rows = facility_data_str[facility_data_str['施設名_str'] == facility_name_str]
+                    display_name = facility_name_str
+                
+                error_message += f"【施設名: {display_name}】\n"
+                error_message += f"  重複している行数: {len(all_duplicate_rows)}行\n"
+                for idx, row in all_duplicate_rows.iterrows():
+                    location = row.get('場所', '不明')
+                    if pd.isna(location):
+                        location = '（空欄）'
+                    # CSVファイルの実際の行番号（ヘッダーを考慮して+2）
+                    csv_row_number = idx + 2
+                    error_message += f"  - CSV行{csv_row_number}: 場所=「{location}」\n"
+                error_message += "\n"
+            
+            error_message += "※ 上記の重複行のうち、不要な行を削除してから再度実行してください。"
+            raise ValueError(error_message)
+        
+        # 空欄チェック（施設名が空の行があるかチェック）
+        # 重複チェックで既に空欄が検出されている場合はスキップ
+        empty_facility_names = facility_data[facility_data['施設名'].isna() | (facility_data['施設名'] == '')]
+        if not empty_facility_names.empty and '' not in facility_duplicates:
+            error_message = "施設情報データに施設名が空欄の行が存在します:\n\n"
+            error_message += f"空欄の行数: {len(empty_facility_names)}行\n"
+            for idx, row in empty_facility_names.iterrows():
+                location = row.get('場所', '不明')
+                if pd.isna(location):
+                    location = '（空欄）'
+                # CSVファイルの実際の行番号（ヘッダーを考慮して+2）
+                csv_row_number = idx + 2
+                error_message += f"- CSV行{csv_row_number}: 場所=「{location}」\n"
+            
+            error_message += "\n※ 上記の空欄行を削除または施設名を入力してから再度実行してください。"
+            raise ValueError(error_message)
+        
+        return facility_data, encoding, debug_info
+        
+    except ValueError:
+        # ValueError は再発生させる
+        raise
+    except Exception as e:
+        raise ValueError(f"施設情報CSVファイルの検証中にエラーが発生しました: {str(e)}")
 
 def main():
     initialize_session_state()
@@ -3030,7 +3267,7 @@ def main():
         
         # バージョン情報（控えめに表示）
         st.markdown("---")
-        st.caption("v2.0 - 2025/07/03")
+        st.caption("v2.1 - 2025/01/27")
     
     st.title("育児サークル情報処理アプリ")
     
