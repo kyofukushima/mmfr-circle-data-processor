@@ -808,6 +808,10 @@ def reset_import_session_state():
     # 統合ユーザー情報もクリア
     if 'user_comprehensive_details' in st.session_state:
         del st.session_state.user_comprehensive_details
+    
+    # すでに発行済みユーザー情報もクリア
+    if 'already_issued_users' in st.session_state:
+        del st.session_state.already_issued_users
 
 def check_file_changed(file, file_type):
     """ファイルが変更されたかチェックし、変更された場合のみセッション状態をリセット
@@ -2223,6 +2227,18 @@ def show_import_data_page():
                             if 'user_modification_details' in st.session_state:
                                 del st.session_state.user_modification_details
                         
+                        # すでに発行済みユーザー情報の表示
+                        if 'already_issued_users' in st.session_state:
+                            already_issued_df = pd.DataFrame(st.session_state.already_issued_users)
+                            
+                            with st.expander(f"ℹ️ 以下のユーザーはすでに登録がありました（インポートデータ作成不要） ({len(already_issued_df)}件)"):
+                                st.dataframe(already_issued_df, use_container_width=True, hide_index=True)
+                                st.caption(f"💡 すでに発行済み: {len(already_issued_df)}件のユーザー")
+                                st.caption("ℹ️ これらのユーザーは既に発行されており、名前とメールアドレスに変更がないため、インポートデータの作成対象外です。")
+                            
+                            # 表示したらセッション状態から削除（重複表示を防ぐ）
+                            del st.session_state.already_issued_users
+                        
                         # 削除対象データの表示
                         deletion_data = formatted_data[formatted_data['修正・削除新規'] == '削除']
                         if not deletion_data.empty:
@@ -2812,6 +2828,9 @@ def create_user_import_data(formatted_data, original_data, user_data):
     # ユーザー作成時のエラー情報を収集
     user_creation_errors = []
     
+    # すでに発行済みユーザー情報を収集（エラーではなく情報表示用）
+    already_issued_users = []
+    
     # 既存のメールアドレスのセットを作成（高速化のため）
     existing_emails = set(user_data['メールアドレス'].astype(str))
     
@@ -2915,12 +2934,13 @@ def create_user_import_data(formatted_data, original_data, user_data):
                             email_diff = email != existing_user_email
                             
                             if not name_diff and not email_diff:
-                                # 差分がない場合：「すでに発行されています」エラー
-                                user_creation_errors.append({
+                                # 差分がない場合：「すでに発行済み」として情報表示用に追加
+                                already_issued_users.append({
                                     '行番号': idx + 1,
                                     'サークル名': circle_name,
-                                    'エラー内容': f"ユーザー '{representative_slug}' はすでに発行されています（名前: {existing_user_name}, メールアドレス: {existing_user_email}）",
-                                    'エラー種別': 'すでに発行済み'
+                                    'ユーザースラッグ': representative_slug,
+                                    'メールアドレス': existing_user_email,
+                                    '詳細': f"名前: {existing_user_name}, メールアドレス: {existing_user_email}"
                                 })
                                 continue
                             # 差分がある場合はエラーとせず、メインデータを正として処理を継続
@@ -2961,7 +2981,6 @@ def create_user_import_data(formatted_data, original_data, user_data):
         # エラー種別ごとに分類
         missing_fields_errors = [e for e in user_creation_errors if e['エラー種別'] == '必須項目不足']
         duplicate_email_errors = [e for e in user_creation_errors if e['エラー種別'] == 'メールアドレス重複']
-        already_issued_errors = [e for e in user_creation_errors if e['エラー種別'] == 'すでに発行済み']
         
         if missing_fields_errors:
             error_warning += "**📝 必須項目不足:**\n"
@@ -2975,21 +2994,18 @@ def create_user_import_data(formatted_data, original_data, user_data):
                 error_warning += f"- 行{error['行番号']}: {error['サークル名']} - {error['エラー内容']}\n"
             error_warning += "\n"
         
-        if already_issued_errors:
-            error_warning += "**✅ すでに発行済み:**\n"
-            for error in already_issued_errors:
-                error_warning += f"- 行{error['行番号']}: {error['サークル名']} - {error['エラー内容']}\n"
-            error_warning += "\n"
-        
         error_warning += "**対処方法:**\n"
         error_warning += "1. 必須項目不足：サークル名とアカウント発行の登録用メールアドレスを入力してください\n"
         error_warning += "2. メールアドレス重複：既存と異なるメールアドレスを使用するか、既存ユーザーの修正を検討してください\n"
         error_warning += "3. 同じファイル内での重複：重複するメールアドレスを修正してください\n"
-        error_warning += "4. すでに発行済み：該当ユーザーは既に発行されています。差分がある場合は修正処理として処理されます\n"
         
         # 警告メッセージをセッション状態に保存
         if 'user_creation_warning' not in st.session_state:
             st.session_state.user_creation_warning = error_warning
+    
+    # すでに発行済みユーザー情報をセッション状態に保存
+    if already_issued_users:
+        st.session_state.already_issued_users = already_issued_users
     
     # 新規と修正をマージ
     if not modified_users_df.empty:
@@ -3267,7 +3283,7 @@ def main():
         
         # バージョン情報（控えめに表示）
         st.markdown("---")
-        st.caption("v2.1 - 2025/01/27")
+        st.caption("v2.2 - 2025/07/09")
     
     st.title("育児サークル情報処理アプリ")
     
