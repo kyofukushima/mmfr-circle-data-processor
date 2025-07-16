@@ -1043,12 +1043,14 @@ def show_sidebar_chat():
                 # ユーザーの質問（ユーザーアイコン付き）
                 user_icon = get_user_icon()
                 
+                import html
+                escaped_user = html.escape(chat['user'])
                 st.sidebar.markdown(f"""
                 <div style="background-color: #f0f2f6; padding: 8px; border-radius: 8px; margin-bottom: 5px; display: flex; align-items: flex-start;">
                     <div style="margin-right: 8px; font-size: 20px;">{user_icon}</div>
                     <div style="flex: 1;">
                         <small style="color: #666;">🕐 {chat['timestamp']}</small><br>
-                        <strong>質問:</strong> {chat['user']}
+                        <strong>質問:</strong> {escaped_user}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -1056,11 +1058,12 @@ def show_sidebar_chat():
                 # AIの回答（ロボットアイコン付き）
                 robot_icon = get_robot_icon()
                 
+                escaped_assistant = html.escape(chat['assistant'])
                 st.sidebar.markdown(f"""
                 <div style="background-color: #e8f4f8; padding: 8px; border-radius: 8px; margin-bottom: 10px; display: flex; align-items: flex-start;">
                     <div style="margin-right: 8px; font-size: 20px;">{robot_icon}</div>
                     <div style="flex: 1;">
-                        {chat['assistant']}
+                        {escaped_assistant}
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -1087,7 +1090,7 @@ def show_sidebar_chat():
             context_time = time.time() - context_start
             
             # チャット応答を生成
-            with st.spinner("回答を生成中..."):
+            with st.sidebar.spinner("回答を生成中..."):
                 chat_start = time.time()
                 response = chat_with_openai(client, user_input, context)
                 chat_time = time.time() - chat_start
