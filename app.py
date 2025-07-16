@@ -1090,14 +1090,8 @@ def show_sidebar_chat():
             context_time = time.time() - context_start
             
             # チャット応答を生成
-            # Streamlit 1.30.0以降でst.sidebar.spinner()が利用可能
-            try:
-                with st.sidebar.spinner("回答を生成中..."):
-                    chat_start = time.time()
-                    response = chat_with_openai(client, user_input, context)
-                    chat_time = time.time() - chat_start
-            except AttributeError:
-                # 古いStreamlitバージョンの場合は通常のspinnerを使用
+            # with st.sidebar: 記法を使用してサイドバー内でspinnerを表示
+            with st.sidebar:
                 with st.spinner("回答を生成中..."):
                     chat_start = time.time()
                     response = chat_with_openai(client, user_input, context)
