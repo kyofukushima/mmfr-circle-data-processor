@@ -7,10 +7,12 @@ import chardet
 import re
 import datetime
 import hashlib
+import json
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Border, Side, Alignment, Font
 from copy import copy
+from openai import OpenAI
 
 # テンプレートファイルのパスを環境変数から取得（テスト時に切り替え可能）
 TEMPLATE_FILE = os.getenv('TEMPLATE_FILE', 'template.xlsx')
@@ -30,6 +32,38 @@ def normalize_value(raw_value):
     if value in ['nan', 'None', '<NA>']:
         return ''
     return value
+
+def get_excel_column_name(column_index):
+    """列のインデックスをエクセル形式のアルファベットに変換する
+    
+    Args:
+        column_index (int): 列のインデックス（0始まり）
+    
+    Returns:
+        str: エクセル形式の列名（A, B, C, ..., AA, AB, ...）
+    """
+    result = ""
+    while column_index >= 0:
+        result = chr(column_index % 26 + ord('A')) + result
+        column_index = column_index // 26 - 1
+    return result
+
+def get_column_position_text(df, column_name):
+    """データフレームの列名から列位置テキストを生成する
+    
+    Args:
+        df (pd.DataFrame): 対象のデータフレーム
+        column_name (str): 列名
+    
+    Returns:
+        str: 列位置テキスト（例: "（BC列）"）
+    """
+    try:
+        column_index = df.columns.get_loc(column_name)
+        excel_column = get_excel_column_name(column_index)
+        return f"（{excel_column}列）"
+    except KeyError:
+        return "（不明列）"
 
 def detect_encoding(file_content):
     """ファイルのエンコーディングを検出する"""
@@ -260,70 +294,135 @@ def add_account_columns(circle_data, last_month_data):
     return circle_data, process_df
 
 def validate_csv_file(csv_file):
-    """CSVファイルの検証を行う"""
-    # 基本的なエンコーディングリスト
-    encodings = ['utf-8', 'shift-jis', 'cp932', 'euc-jp']
-    detected_encoding = None
+    """CSVファイルの検証を行う（セキュリティと品質を維持した最適化版）"""
+    import time
+    
+    # 開始時間を記録
+    start_time = time.time()
     debug_info = []
+    timing_info = []
     
-    # ファイルの内容を読み込む
-    file_content = csv_file.read()
-    csv_file.seek(0)
+    # ファイルの内容を一度だけ読み込む（最大サイズを制限）
+    file_read_start = time.time()
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+    file_content = csv_file.read(MAX_FILE_SIZE)
+    if len(file_content) == MAX_FILE_SIZE:
+        raise ValueError("ファイルサイズが制限を超えています（最大10MB）")
     
-    # chardetによるエンコーディング検出
-    detected_enc, confidence = detect_encoding(file_content)
-    if detected_enc:
-        encodings.insert(0, detected_enc)
-        debug_info.append(f"chardetが検出したエンコーディング: {detected_enc} (信頼度: {confidence:.2f})")
+    file_read_time = time.time() - file_read_start
+    timing_info.append(f"ファイル読み込み: {file_read_time:.3f}秒")
     
-    # 重複を削除
-    encodings = list(dict.fromkeys(encodings))
+    # chardetによるエンコーディング検出（処理時間短縮のため一時的にコメントアウト）
+    # detected_enc, confidence = detect_encoding(file_content)
+    # debug_info.append(f"chardetが検出したエンコーディング: {detected_enc} (信頼度: {confidence:.2f})")
+    
+    # 試行するエンコーディングの順序を決定（固定順序で高速化）
+    # encodings = [detected_enc] if detected_enc else []
+    # encodings.extend(['utf-8', 'shift-jis', 'cp932', 'euc-jp'])
+    # encodings = list(dict.fromkeys(encodings))
+    encodings = ['utf-8-sig', 'utf-8', 'shift-jis', 'cp932', 'euc-jp']
+    debug_info.append("エンコーディング検出をスキップし、固定順序で試行します（UTF-8 BOM対応）")
+    
+    encoding_start = time.time()
+    successful_encoding = None
     
     for encoding in encodings:
         try:
+            encoding_try_start = time.time()
             debug_info.append(f"エンコーディング {encoding} で試行中...")
             
-            # ファイルポインタを先頭に戻す
-            csv_file.seek(0)
+            # まず一部のデータでテスト（先頭1000バイト）
+            sample_test_start = time.time()
+            sample_size = min(1000, len(file_content))
+            try:
+                sample = file_content[:sample_size].decode(encoding)
+            except UnicodeDecodeError:
+                # サンプルテストで失敗した場合、エラー処理付きで再試行
+                try:
+                    sample = file_content[:sample_size].decode(encoding, errors='ignore')
+                    debug_info.append(f"  → サンプルデコードでエラー文字を無視しました")
+                except:
+                    debug_info.append(f"  → サンプルデコードに失敗")
+                    continue
             
-            # 最初の数行を読んでエンコーディングをチェック
-            sample = file_content.decode(encoding)
+            sample_test_time = time.time() - sample_test_start
+            timing_info.append(f"サンプルテスト({encoding}): {sample_test_time:.3f}秒")
+            
             if not sample.strip():
-                debug_info.append(f"  → ファイルが空です")
+                debug_info.append(f"  → サンプルデータが空です")
                 continue
             
-            # ファイルポインタを先頭に戻す
-            csv_file.seek(0)
+            # 全体をデコード（エラー処理付き）
+            full_decode_start = time.time()
+            try:
+                decoded_content = file_content.decode(encoding)
+            except UnicodeDecodeError:
+                # エラー文字を無視してデコード
+                decoded_content = file_content.decode(encoding, errors='ignore')
+                debug_info.append(f"  → 全体デコードでエラー文字を無視しました")
             
-            # CSVとして読み込めるかチェック
-            df = pd.read_csv(io.StringIO(sample), encoding=encoding)
+            full_decode_time = time.time() - full_decode_start
+            timing_info.append(f"全体デコード({encoding}): {full_decode_time:.3f}秒")
+            
+            # CSVとしての基本検証
+            csv_parse_start = time.time()
+            df = pd.read_csv(io.StringIO(decoded_content))
+            csv_parse_time = time.time() - csv_parse_start
+            timing_info.append(f"CSV解析({encoding}): {csv_parse_time:.3f}秒")
+            
+            # データ品質の検証
+            validation_start = time.time()
+
+            # CSVファイルとしての基本的な構造確認のみ
             if df.empty:
                 debug_info.append(f"  → データが空です")
                 continue
             if len(df.columns) == 0:
                 debug_info.append(f"  → 列が存在しません")
                 continue
-                
-            # ファイルポインタを先頭に戻す
-            csv_file.seek(0)
-            detected_encoding = encoding
-            debug_info.append(f"  → 正常に読み込めました")
-            return df, detected_encoding, debug_info
             
-        except UnicodeDecodeError as e:
-            debug_info.append(f"  → デコードエラー: {str(e)}")
+            validation_time = time.time() - validation_start
+            timing_info.append(f"データ検証({encoding}): {validation_time:.3f}秒")
+            
+            encoding_try_time = time.time() - encoding_try_start
+            timing_info.append(f"エンコーディング試行完了({encoding}): {encoding_try_time:.3f}秒")
+            
+            debug_info.append(f"  → 正常に読み込めました")
+            successful_encoding = encoding
+            break
+            
+        except UnicodeDecodeError:
+            debug_info.append(f"  → デコードエラー")
             continue
         except pd.errors.EmptyDataError:
             debug_info.append(f"  → 空のCSVファイル")
             raise ValueError("CSVファイルが空です")
+        except ValueError as e:
+            # 検証エラーは上位に伝播
+            raise e
         except Exception as e:
             debug_info.append(f"  → その他のエラー: {str(e)}")
             continue
     
-    error_msg = "CSVファイルのエンコーディングを認識できません。以下のいずれかの形式で保存してください：UTF-8、Shift-JIS、CP932、EUC-JP"
+    if successful_encoding is None:
+        error_msg = "CSVファイルのエンコーディングを認識できません。以下のいずれかの形式で保存してください：UTF-8、Shift-JIS、CP932、EUC-JP"
+        if st.session_state.get('debug_mode', False):
+            error_msg += "\n\nデバッグ情報:\n" + "\n".join(debug_info)
+        raise ValueError(error_msg)
+    
+    encoding_total_time = time.time() - encoding_start
+    timing_info.append(f"エンコーディング処理合計: {encoding_total_time:.3f}秒")
+    
+    total_time = time.time() - start_time
+    timing_info.append(f"全体処理時間: {total_time:.3f}秒")
+    
+    # デバッグモード時に処理時間を表示
     if st.session_state.get('debug_mode', False):
-        error_msg += "\n\nデバッグ情報:\n" + "\n".join(debug_info)
-    raise ValueError(error_msg)
+        st.write("**⏱️ CSVファイル読み込み処理時間:**")
+        for timing in timing_info:
+            st.write(f"  - {timing}")
+    
+    return df, successful_encoding, debug_info
 
 def copy_cell_format(source_cell, target_cell):
     """セルの書式をコピーする"""
@@ -344,11 +443,21 @@ def validate_excel_file(excel_file):
     Returns:
         pd.DataFrame: 読み込んだデータフレーム
     """
+    import time
+    
+    # 開始時間を記録
+    start_time = time.time()
+    timing_info = []
+    
     try:
         # Excelファイルを読み込む（2,3行目をスキップ）
+        excel_read_start = time.time()
         df = pd.read_excel(excel_file, skiprows=[1,2])
+        excel_read_time = time.time() - excel_read_start
+        timing_info.append(f"Excelファイル読み込み: {excel_read_time:.3f}秒")
         
         # 基本的な検証
+        validation_start = time.time()
         if df.empty:
             raise ValueError("Excelファイルにデータが存在しません")
             
@@ -358,6 +467,18 @@ def validate_excel_file(excel_file):
         # ヘッダーの存在確認
         if df.columns.isna().any():
             raise ValueError("ヘッダー行に空の列名が存在します")
+        
+        validation_time = time.time() - validation_start
+        timing_info.append(f"基本検証: {validation_time:.3f}秒")
+        
+        total_time = time.time() - start_time
+        timing_info.append(f"全体処理時間: {total_time:.3f}秒")
+        
+        # デバッグモード時に処理時間を表示
+        if st.session_state.get('debug_mode', False):
+            st.write("**⏱️ Excelファイル読み込み処理時間:**")
+            for timing in timing_info:
+                st.write(f"  - {timing}")
         
         return df
         
@@ -554,14 +675,8 @@ def process_files(circle_data, facility_data=None, last_month_data=None):
     circle_data, account_process_df = add_account_columns(circle_data, last_month_data)
     process_df = pd.concat([process_df, account_process_df], ignore_index=True)
     
-    # 処理内容の表示
-    if not process_df.empty:
-        with st.expander("処理内容を確認する"):
-            st.dataframe(process_df, use_container_width=True, hide_index=True)
-    
-    # 処理後のデータフレームを表示
-    with st.expander("処理後のデータフレームを確認する"):
-        st.dataframe(circle_data, use_container_width=True)
+    # 処理内容と処理後データの表示は外部で行う（UIの流れを改善するため）
+    # この関数からは処理内容データも返すように変更
     
     # ファイルを保存
     output = io.BytesIO()
@@ -631,12 +746,392 @@ def process_files(circle_data, facility_data=None, last_month_data=None):
     processing_time = time.time() - start_time if st.session_state.get('debug_mode', False) else None
     
     output.seek(0)
-    return output, processing_time
+    return output, processing_time, process_df, circle_data
+
+def get_openai_client():
+    """OpenAI APIクライアントを取得する"""
+    try:
+        api_key = st.secrets["openai"]["api_key"]
+        if api_key == "YOUR_OPENAI_API_KEY_HERE":
+            return None
+        
+        client = OpenAI(
+            api_key=api_key
+        )
+        return client
+    except Exception as e:
+        st.error(f"OpenAI API設定エラー: {str(e)}")
+        return None
+
+def get_robot_icon():
+    """ロボットアイコンを取得する（画像ファイルまたは絵文字）"""
+    # 複数の画像ファイルパスを試行（アップロードされた画像を優先）
+    possible_paths = [
+        "img/bot.png",  # アップロードされたキャラクター画像
+        "robot_icon.png",
+        "images/robot.png", 
+        "assets/robot.png",
+        "robot_icon.jpg",
+        "images/robot.jpg",
+        "assets/robot.jpg",
+        "robot_icon.gif",
+        "images/robot.gif",
+        "assets/robot.gif"
+    ]
+    
+    for robot_image_path in possible_paths:
+        if os.path.exists(robot_image_path):
+            try:
+                # Base64エンコーディングで画像を埋め込む
+                import base64
+                with open(robot_image_path, "rb") as img_file:
+                    img_data = base64.b64encode(img_file.read()).decode()
+                    
+                    # ファイル拡張子に応じてMIMEタイプを決定
+                    if robot_image_path.lower().endswith('.png'):
+                        mime_type = "image/png"
+                    elif robot_image_path.lower().endswith('.jpg') or robot_image_path.lower().endswith('.jpeg'):
+                        mime_type = "image/jpeg"
+                    elif robot_image_path.lower().endswith('.gif'):
+                        mime_type = "image/gif"
+                    else:
+                        mime_type = "image/png"  # デフォルト
+                    
+                    # アップロードされたキャラクター画像の場合は少し大きく表示
+                    if "bot.png" in robot_image_path:
+                        return f'<img src="data:{mime_type};base64,{img_data}" style="width: 32px; height: 32px; border-radius: 50%; object-fit: cover;">'
+                    else:
+                        return f'<img src="data:{mime_type};base64,{img_data}" style="width: 24px; height: 24px; border-radius: 50%; object-fit: cover;">'
+            except Exception as e:
+                # 画像読み込みエラーの場合は次のパスを試行
+                continue
+    
+    # 画像ファイルが存在しない場合は絵文字を使用
+    return "🤖"
+
+def get_user_icon():
+    """ユーザーアイコンを取得する（画像ファイルまたは絵文字）"""
+    # 複数の画像ファイルパスを試行
+    possible_paths = [
+        "user_icon.png",
+        "images/user.png", 
+        "assets/user.png",
+        "user_icon.jpg",
+        "images/user.jpg",
+        "assets/user.jpg"
+    ]
+    
+    for user_image_path in possible_paths:
+        if os.path.exists(user_image_path):
+            try:
+                # Base64エンコーディングで画像を埋め込む
+                import base64
+                with open(user_image_path, "rb") as img_file:
+                    img_data = base64.b64encode(img_file.read()).decode()
+                    
+                    # ファイル拡張子に応じてMIMEタイプを決定
+                    if user_image_path.lower().endswith('.png'):
+                        mime_type = "image/png"
+                    elif user_image_path.lower().endswith('.jpg') or user_image_path.lower().endswith('.jpeg'):
+                        mime_type = "image/jpeg"
+                    else:
+                        mime_type = "image/png"  # デフォルト
+                    
+                    return f'<img src="data:{mime_type};base64,{img_data}" style="width: 24px; height: 24px; border-radius: 50%; object-fit: cover;">'
+            except Exception as e:
+                # 画像読み込みエラーの場合は次のパスを試行
+                continue
+    
+    # 画像ファイルが存在しない場合は絵文字を使用
+    return "👤"
+
+def get_codebase_context():
+    """外部ファイルから詳細仕様書を読み込む"""
+    import time
+    import streamlit as st
+    
+    # 開始時間を記録
+    start_time = time.time()
+    timing_info = []
+    
+    try:
+        # ファイルパス取得の時間測定
+        path_start = time.time()
+        spec_file_path = os.path.join(os.path.dirname(__file__), 'app_specification.md')
+        path_time = time.time() - path_start
+        timing_info.append(f"ファイルパス取得: {path_time:.3f}秒")
+        
+        # ファイル存在チェックの時間測定
+        check_start = time.time()
+        file_exists = os.path.exists(spec_file_path)
+        check_time = time.time() - check_start
+        timing_info.append(f"ファイル存在チェック: {check_time:.3f}秒")
+        
+        # ファイルが存在しない場合のフォールバック
+        if not file_exists:
+            fallback_content = """
+            # 育児サークル情報処理ツール - 基本情報
+            
+            仕様書ファイル (app_specification.md) が見つかりません。
+            基本的な使い方については、サイドバーの使い方説明を参照してください。
+            
+            ## 主な機能
+            1. データ修正用エクセル作成
+            2. インポートデータ作成（16項目検証）
+            3. AIチャット機能
+            """
+            
+            total_time = time.time() - start_time
+            timing_info.append(f"フォールバック処理: {total_time:.3f}秒")
+            
+            # デバッグモード時に処理時間を表示
+            if st.session_state.get('debug_mode', False):
+                st.sidebar.markdown("**⏱️ 仕様書読み込み処理時間（フォールバック）:**")
+                for timing in timing_info:
+                    st.sidebar.text(f"  - {timing}")
+            
+            return fallback_content
+        
+        # ファイルから仕様書を読み込み
+        file_read_start = time.time()
+        with open(spec_file_path, 'r', encoding='utf-8') as f:
+            context = f.read()
+        file_read_time = time.time() - file_read_start
+        timing_info.append(f"ファイル読み込み: {file_read_time:.3f}秒")
+        
+        # 全体処理時間
+        total_time = time.time() - start_time
+        timing_info.append(f"全体処理時間: {total_time:.3f}秒")
+        
+        # デバッグモード時に処理時間を表示
+        if st.session_state.get('debug_mode', False):
+            st.sidebar.markdown("**⏱️ 仕様書読み込み処理時間:**")
+            for timing in timing_info:
+                st.sidebar.text(f"  - {timing}")
+            st.sidebar.info(f"仕様書サイズ: {len(context):,} 文字")
+        
+        return context
+        
+    except Exception as e:
+        error_time = time.time() - start_time
+        timing_info.append(f"エラー発生まで: {error_time:.3f}秒")
+        
+        # デバッグモード時にエラー時の処理時間も表示
+        if st.session_state.get('debug_mode', False):
+            st.sidebar.markdown("**⏱️ 仕様書読み込み処理時間（エラー）:**")
+            for timing in timing_info:
+                st.sidebar.text(f"  - {timing}")
+            st.sidebar.error(f"ファイル読み込みエラー: {str(e)}")
+        
+        # エラー時のフォールバック
+        return f"""
+        # 育児サークル情報処理ツール - エラー
+        
+        仕様書の読み込み中にエラーが発生しました: {str(e)}
+        
+        ## 基本機能
+        - データ修正用エクセル作成
+        - インポートデータ作成
+        - 16項目のデータ検証
+        - AIチャット機能
+        """
+
+def chat_with_openai(client, message, context):
+    """OpenAI APIを使用してチャット応答を生成する"""
+    import time
+    import streamlit as st
+    
+    # 開始時間を記録
+    start_time = time.time()
+    timing_info = []
+    
+    try:
+        # メッセージ準備の時間測定
+        message_prep_start = time.time()
+        messages = [
+            {
+                "role": "system",
+                "content": f"""あなたは育児サークル情報処理ツールの専門サポートエージェントです。
+                以下のコードベース情報を参考に、ユーザーの質問に日本語で回答してください。
+                
+                {context}
+                
+                回答は簡潔で分かりやすく、具体的な手順を含めてください。
+                技術的な詳細よりも、実際の使用方法に焦点を当ててください。"""
+            },
+            {
+                "role": "user",
+                "content": message
+            }
+        ]
+        message_prep_time = time.time() - message_prep_start
+        timing_info.append(f"メッセージ準備: {message_prep_time:.3f}秒")
+        
+        # OpenAI API呼び出しの時間測定
+        api_call_start = time.time()
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini-2025-04-14",
+            messages=messages,
+            max_tokens=1500,
+            temperature=0.1
+        )
+        api_call_time = time.time() - api_call_start
+        timing_info.append(f"OpenAI API呼び出し: {api_call_time:.3f}秒")
+        
+        # レスポンス処理の時間測定
+        response_process_start = time.time()
+        response_content = response.choices[0].message.content
+        response_process_time = time.time() - response_process_start
+        timing_info.append(f"レスポンス処理: {response_process_time:.3f}秒")
+        
+        # 全体処理時間
+        total_time = time.time() - start_time
+        timing_info.append(f"全体処理時間: {total_time:.3f}秒")
+        
+        # デバッグモード時に処理時間を表示
+        if st.session_state.get('debug_mode', False):
+            st.sidebar.markdown("**⏱️ サポートチャット処理時間:**")
+            for timing in timing_info:
+                st.sidebar.text(f"  - {timing}")
+        
+        return response_content
+        
+    except Exception as e:
+        error_time = time.time() - start_time
+        timing_info.append(f"エラー発生まで: {error_time:.3f}秒")
+        
+        # デバッグモード時にエラー時の処理時間も表示
+        if st.session_state.get('debug_mode', False):
+            st.sidebar.markdown("**⏱️ サポートチャット処理時間（エラー）:**")
+            for timing in timing_info:
+                st.sidebar.text(f"  - {timing}")
+            st.sidebar.error(f"API呼び出しエラー: {str(e)}")
+        
+        return f"申し訳ございません。エラーが発生しました: {str(e)}"
+
+def show_sidebar_chat():
+    """サイドバーにチャット機能を表示する"""
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 💬 サポートチャット")
+    
+    # APIキーの確認
+    client = get_openai_client()
+    if client is None:
+        st.sidebar.warning("⚠️ OpenAI APIキーが設定されていません。")
+        st.sidebar.markdown("""
+        **設定方法:**
+        1. `.streamlit/secrets.toml` を編集
+        2. `[openai]` セクションに `api_key = "your_actual_api_key"` を設定
+        3. ツールを再起動
+        """)
+        return
+    
+    # チャット履歴の初期化
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    
+    # チャット履歴の表示（古い順に表示）
+    if st.session_state.chat_history:
+        # チャット履歴を上から古い順に表示（ChatGPT/Cursor風）
+        chat_container = st.sidebar.container()
+        
+        with chat_container:
+            # 最新の5件を表示（サイドバーのスペース制限のため）
+            recent_chats = st.session_state.chat_history[-5:]
+            
+            for i, chat in enumerate(recent_chats):
+                # ユーザーの質問（ユーザーアイコン付き）
+                user_icon = get_user_icon()
+                
+                st.sidebar.markdown(f"""
+                <div style="background-color: #f0f2f6; padding: 8px; border-radius: 8px; margin-bottom: 5px; display: flex; align-items: flex-start;">
+                    <div style="margin-right: 8px; font-size: 20px;">{user_icon}</div>
+                    <div style="flex: 1;">
+                        <small style="color: #666;">🕐 {chat['timestamp']}</small><br>
+                        <strong>質問:</strong> {chat['user']}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # AIの回答（ロボットアイコン付き）
+                robot_icon = get_robot_icon()
+                
+                st.sidebar.markdown(f"""
+                <div style="background-color: #e8f4f8; padding: 8px; border-radius: 8px; margin-bottom: 10px; display: flex; align-items: flex-start;">
+                    <div style="margin-right: 8px; font-size: 20px;">{robot_icon}</div>
+                    <div style="flex: 1;">
+                        {chat['assistant']}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+    
+    # チャット入力（履歴の下に配置）
+    user_input = st.sidebar.text_area(
+        "質問を入力してください:",
+        height=80,
+        placeholder="例: エラーが出た時はどうすればいいですか？",
+        key="chat_input"
+    )
+    
+    # 送信ボタン
+    if st.sidebar.button("📤 送信", key="chat_send", use_container_width=True):
+        if user_input.strip():
+            import time
+            
+            # 全体処理時間の測定開始
+            overall_start = time.time()
+            
+            # コードベースの文脈を取得
+            context_start = time.time()
+            context = get_codebase_context()
+            context_time = time.time() - context_start
+            
+            # チャット応答を生成
+            with st.spinner("回答を生成中..."):
+                chat_start = time.time()
+                response = chat_with_openai(client, user_input, context)
+                chat_time = time.time() - chat_start
+            
+            # チャット履歴に追加
+            history_start = time.time()
+            st.session_state.chat_history.append({
+                "user": user_input,
+                "assistant": response,
+                "timestamp": datetime.datetime.now().strftime("%H:%M:%S")
+            })
+            history_time = time.time() - history_start
+            
+            # 全体処理時間
+            overall_time = time.time() - overall_start
+            
+            # デバッグモード時に全体の処理時間を表示
+            if st.session_state.get('debug_mode', False):
+                st.sidebar.markdown("**⏱️ サポートチャット全体処理時間:**")
+                st.sidebar.text(f"  - コンテキスト取得: {context_time:.3f}秒")
+                st.sidebar.text(f"  - チャット応答生成: {chat_time:.3f}秒")
+                st.sidebar.text(f"  - 履歴追加: {history_time:.3f}秒")
+                st.sidebar.text(f"  - 全体処理時間: {overall_time:.3f}秒")
+                st.sidebar.markdown("---")
+            
+            # 入力をクリア
+            st.rerun()
+    
+    # 履歴クリアボタン（送信ボタンの下に配置）
+    if st.session_state.chat_history:
+        if st.sidebar.button("🗑️ 履歴をクリア", key="chat_clear"):
+            st.session_state.chat_history = []
+            st.rerun()
+    
+
 
 def initialize_session_state():
     """セッション状態の初期化"""
     if 'debug_mode' not in st.session_state:
         st.session_state.debug_mode = False
+    
+    # 機能選択の前回状態を追加
+    if 'previous_function' not in st.session_state:
+        st.session_state.previous_function = None
     
     # インポートデータ作成用のセッション状態
     if 'validation_completed' not in st.session_state:
@@ -885,28 +1380,38 @@ def validate_order_column(df):
         
         st.warning("\n".join(warning_message))
 
-def show_modification_excel_page():
+def show_excel_creation_page():
     """データ修正用エクセル作成ページの表示"""
-    st.header("データ修正用エクセル作成")
+    # st.header("データ修正用エクセル作成", divider='orange')
     
-    # デバッグモード時のみ表示される情報
     if st.session_state.debug_mode:
-        st.write("### デバッグ情報")
         st.write("デバッグモードが有効です")
     
-    st.write("### ファイルのアップロード")
+    st.header('STEP1：ファイルのアップロード', divider='orange')
     
     # 育児サークルCSVファイルのアップロード
-    csv_file = st.file_uploader("育児サークルCSVファイルを選択してください", type=['csv'])
+    st.write("**1. 育児サークル情報（csv）をアップロードしてください。**")
+    csv_file = st.file_uploader("例: kitakyushu-city_circle_info_00000000000.csv", type=['csv'])
     if csv_file:
         try:
             # CSVファイルの検証と読み込み
+            import time
+            overall_start = time.time()
             circle_data, encoding, debug_info = validate_csv_file(csv_file)
             
             # 順番列の検証（検証の必要性について確認中。必要であればコメントアウト解除）
             # validate_order_column(circle_data)
             
+            overall_time = time.time() - overall_start
+            
             st.success("育児サークルCSVファイルが正常に読み込まれました")
+            
+            # デバッグモード時に追加情報を表示
+            if st.session_state.get('debug_mode', False):
+                st.write(f"**📊 データ情報:** 行数: {len(circle_data)}, 列数: {len(circle_data.columns)}")
+                st.write(f"**🔤 エンコーディング:** {encoding}")
+                st.write(f"**⏱️ 全体処理時間:** {overall_time:.3f}秒")
+            
             with st.expander("育児サークルデータを確認する"):
                 st.dataframe(circle_data, use_container_width=True)
         except ValueError as e:
@@ -915,12 +1420,24 @@ def show_modification_excel_page():
             st.error(f"育児サークルCSVファイルの予期せぬエラー: {str(e)}")
     
     # 施設情報CSVファイルのアップロード
-    facility_csv_file = st.file_uploader("施設情報CSVファイルを選択してください", type=['csv'])
+    st.write("**2. 施設情報（csv）をアップロードしてください。**")
+    facility_csv_file = st.file_uploader("例: kitakyushu-city_facility_00000000000.csv", type=['csv'])
     if facility_csv_file:
         try:
             # 施設情報CSVファイルの検証と読み込み（専用の検証関数を使用）
+            import time
+            overall_start = time.time()
             facility_data, facility_encoding, facility_debug_info = validate_facility_csv_file(facility_csv_file)
+            overall_time = time.time() - overall_start
+            
             st.success("施設情報CSVファイルが正常に読み込まれました")
+            
+            # デバッグモード時に追加情報を表示
+            if st.session_state.get('debug_mode', False):
+                st.write(f"**📊 データ情報:** 行数: {len(facility_data)}, 列数: {len(facility_data.columns)}")
+                st.write(f"**🔤 エンコーディング:** {facility_encoding}")
+                st.write(f"**⏱️ 全体処理時間:** {overall_time:.3f}秒")
+            
             with st.expander("施設情報データを確認する"):
                 st.dataframe(facility_data, use_container_width=True)
         except ValueError as e:
@@ -929,17 +1446,31 @@ def show_modification_excel_page():
             st.error(f"施設情報CSVファイルの予期せぬエラー: {str(e)}")
     
     # 先月分のデータ（Excelファイル）のアップロード
-    last_month_file = st.file_uploader("先月分のデータ（Excelファイル）を選択してください", type=['xlsx'])
+    st.write("**3. 先月分のデータ（xlsx）をアップロードしてください。**")
+    last_month_file = st.file_uploader("例: 【北九州市様】育児サークル等修正用データ（00月分）.xlsx", type=['xlsx'])
     if last_month_file:
         try:
             # Excelファイルの検証と読み込み
+            import time
+            overall_start = time.time()
             last_month_data = validate_excel_file(last_month_file)
             
             # データの整合性チェック（スラッグの一致確認）
+            consistency_start = time.time()
             if 'circle_data' in locals() and circle_data is not None:
                 check_data_consistency(circle_data, last_month_data)
+            consistency_time = time.time() - consistency_start
+            
+            overall_time = time.time() - overall_start
             
             st.success("先月分のExcelファイルが正常に読み込まれました")
+            
+            # デバッグモード時に追加情報を表示
+            if st.session_state.get('debug_mode', False):
+                st.write(f"**📊 データ情報:** 行数: {len(last_month_data)}, 列数: {len(last_month_data.columns)}")
+                st.write(f"**🔍 整合性チェック時間:** {consistency_time:.3f}秒")
+                st.write(f"**⏱️ 全体処理時間:** {overall_time:.3f}秒")
+            
             with st.expander("先月情報データを確認する"):
                 st.dataframe(last_month_data, use_container_width=True)
         except ValueError as e:
@@ -957,13 +1488,22 @@ def show_modification_excel_page():
     if all_data_ready:
         st.success("全てのファイルが正常に読み込まれました。処理を開始できます。")
         
+        st.header('STEP2：データ処理の実行', divider='orange')
+        
         # 自治体名の入力フィールドを追加（デフォルト値：北九州市様）
         municipality = st.text_input("自治体名", value="北九州市様", help="ダウンロードファイル名に使用される自治体名を入力してください")
+        
+        # 処理内容を事前に確認
+        with st.expander("処理内容を確認する"):
+            st.write("以下の処理が実行されます：")
+            st.write("1. 0/1の値を持つ列の変換処理（○/空欄への変換）")
+            st.write("2. 場所列の追加（施設情報との突合）")
+            st.write("3. アカウント情報の追加（先月分データとの突合）")
         
         if st.button("処理開始"):
             try:
                 # ファイル処理を実行
-                output, proc_time = process_files(
+                output, proc_time, process_df, processed_circle_data = process_files(
                     circle_data,
                     facility_data=facility_data,
                     last_month_data=last_month_data
@@ -978,6 +1518,16 @@ def show_modification_excel_page():
                     st.info(f"CSVファイルの列数: {len(circle_data.columns)}列")
                     st.info(f"テンプレートファイルの列数: {template_ws.max_column}列")
                 
+                st.success("ファイルの処理が完了しました！")
+                
+                st.header('STEP3：処理結果の確認', divider='orange')
+                
+                # 処理後のデータフレームを表示
+                with st.expander("処理後のデータフレームを確認する"):
+                    st.dataframe(processed_circle_data, use_container_width=True)
+                
+                st.header('STEP4：ダウンロード', divider='orange')
+                
                 # 現在の月を取得
                 current_month = datetime.datetime.now().month
                 
@@ -991,8 +1541,6 @@ def show_modification_excel_page():
                     file_name=file_name,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
-                
-                st.success("ファイルの処理が完了しました！")
                 
             except ValueError as e:
                 st.error(str(e))
@@ -1018,7 +1566,8 @@ def validate_modification_status(main_data, original_data):
         
         # ステータス値の検証
         if status != '' and status not in valid_statuses:
-            error_list.append(f"修正・削除新規列に、次の値以外が入力されています。(修正・新規追加・掲載順・削除)")
+            column_pos = get_column_position_text(main_data, '修正・削除新規')
+            error_list.append(f"{column_pos}修正・削除新規列に、次の値以外が入力されています。(修正・新規追加・掲載順・削除)")
         
         # 修正ステータスの検証
         if status == '修正':
@@ -1044,13 +1593,22 @@ def validate_modification_status(main_data, original_data):
                     if not has_difference:
                         # アカウント関連のみの変更の場合はエラーとしない
                         if not is_only_account_related_change(row, original_data):
-                            error_list.append("修正にもかかわらず、値が変更されていません")
+                            column_pos = get_column_position_text(main_data, '修正・削除新規')
+                            error_list.append(f"{column_pos}修正にもかかわらず、値が変更されていません")
         
         # 新規追加ステータスの検証
         elif status == '新規追加':
             slug = normalize_value(row.get('スラッグ', ''))
             if slug != '':
-                error_list.append("新規追加にもかかわらずスラッグ列に値が入力されています")
+                slug_column_pos = get_column_position_text(main_data, 'スラッグ')
+                error_list.append(f"{slug_column_pos}新規追加にもかかわらずスラッグ列に値が入力されています")
+            
+            # HP掲載可列の検証
+            hp_publish = normalize_value(row.get('HP掲載可', ''))
+            if hp_publish != '○':
+                modification_column_pos = get_column_position_text(main_data, '修正・削除新規')
+                hp_column_pos = get_column_position_text(main_data, 'HP掲載可')
+                error_list.append(f"{modification_column_pos}修正・削除新規列が「新規追加」ですが{hp_column_pos}HP掲載可列の値が「○」ではありません")
         
         # 掲載順ステータスの検証
         elif status == '掲載順':
@@ -1062,7 +1620,8 @@ def validate_modification_status(main_data, original_data):
                     original_order = normalize_value(original_row.iloc[0].get('順番', ''))
                     
                     if main_order == original_order:
-                        error_list.append("「掲載順」ステータスが振られていますが、順番が変わっていません")
+                        order_column_pos = get_column_position_text(main_data, '順番')
+                        error_list.append(f"{order_column_pos}「掲載順」ステータスが振られていますが、順番が変わっていません")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1103,7 +1662,13 @@ def validate_empty_status(main_data, original_data):
                                 changed_columns.append(col)
                     
                     if changed_columns:
-                        error_list.append(f"修正と書かれていませんが、{','.join(changed_columns)}の値が変更されています")
+                        # 変更された列の位置情報を取得
+                        changed_columns_with_pos = []
+                        for col in changed_columns:
+                            col_pos = get_column_position_text(main_data, col)
+                            changed_columns_with_pos.append(f"{col_pos}{col}")
+                        
+                        error_list.append(f"修正と書かれていませんが、{','.join(changed_columns_with_pos)}の値が変更されています")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1137,7 +1702,8 @@ def validate_machine_dependent_characters(main_data):
                 if value:  # 空欄でない場合のみチェック
                     for char in machine_dependent_chars:
                         if char in value:
-                            error_list.append(f"{col}列に機種依存文字が含まれています")
+                            col_pos = get_column_position_text(main_data, col)
+                            error_list.append(f"{col_pos}{col}列に機種依存文字が含まれています")
                             break
         
         errors.append(', '.join(error_list) if error_list else '')
@@ -1167,7 +1733,8 @@ def validate_cell_line_breaks(main_data):
                 value = normalize_value(row.get(col, ''))
                 
                 if value and ('\n' in value or '\r' in value):
-                    error_list.append(f"{col}列にセル内改行が含まれています")
+                    col_pos = get_column_position_text(main_data, col)
+                    error_list.append(f"{col_pos}{col}列にセル内改行が含まれています")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1212,7 +1779,13 @@ def validate_prohibited_changes(main_data, original_data):
                             changed_columns.append(col)
                 
                 if changed_columns:
-                    error_list.append(f"{','.join(changed_columns)}の値が変更されています")
+                    # 変更された列の位置情報を取得
+                    changed_columns_with_pos = []
+                    for col in changed_columns:
+                        col_pos = get_column_position_text(main_data, col)
+                        changed_columns_with_pos.append(f"{col_pos}{col}")
+                    
+                    error_list.append(f"{','.join(changed_columns_with_pos)}の値が変更されています")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1240,7 +1813,8 @@ def validate_consecutive_spaces(main_data):
                 value = normalize_value(row.get(col, ''))
                 
                 if value and '   ' in value:  # 3つ以上の連続した空白
-                    error_list.append(f"{col}列に連続した空白が含まれています")
+                    col_pos = get_column_position_text(main_data, col)
+                    error_list.append(f"{col_pos}{col}列に連続した空白が含まれています")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1270,7 +1844,8 @@ def validate_alphanumeric(main_data):
                 if value:  # 空欄でない場合のみチェック
                     # 半角英数字、各種ハイフン、ピリオド、スラッシュ、コロンのみ許可
                     if not re.match(r'^[a-zA-Z0-9\-‐–—−\.\/:]*$', value):
-                        error_list.append(f"{col}列に半角英数字以外の文字が含まれています")
+                        col_pos = get_column_position_text(main_data, col)
+                        error_list.append(f"{col_pos}{col}列に半角英数字以外の文字が含まれています")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1298,7 +1873,8 @@ def validate_email_addresses(main_data):
                 value = normalize_value(row.get(col, ''))
                 
                 if value and not email_pattern.match(value):
-                    error_list.append(f"{col}列のメールアドレスが無効です")
+                    col_pos = get_column_position_text(main_data, col)
+                    error_list.append(f"{col_pos}{col}列のメールアドレスが無効です")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1330,7 +1906,8 @@ def validate_required_fields(main_data):
                 value = normalize_value(row.get(col, ''))
                 
                 if not value:
-                    error_list.append(f"{col}列が空欄です")
+                    col_pos = get_column_position_text(main_data, col)
+                    error_list.append(f"{col_pos}{col}列が空欄です")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1360,7 +1937,8 @@ def validate_circle_or_cross(main_data):
                 value = normalize_value(row.get(col, ''))
                 
                 if value and value not in ['○', '']:
-                    error_list.append(f"{col}列に○または空欄以外の値が入力されています")
+                    col_pos = get_column_position_text(main_data, col)
+                    error_list.append(f"{col_pos}{col}列に○または空欄以外の値が入力されています")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1432,11 +2010,24 @@ async def validate_website_urls(main_data):
                     _, error_msg = await is_url_alive(url, target_column, session)
                     if idx >= len(errors):
                         errors.extend([''] * (idx - len(errors) + 1))
+                    
+                    # エラーメッセージに列位置を追加
+                    if error_msg:
+                        col_pos = get_column_position_text(main_data, target_column)
+                        # 既存のエラーメッセージから列名部分を除去して列位置を追加
+                        if error_msg.startswith(f'{target_column}列で'):
+                            error_msg = error_msg.replace(f'{target_column}列で', f'{col_pos}{target_column}列で')
+                        elif error_msg.startswith(f'{target_column}列'):
+                            error_msg = error_msg.replace(f'{target_column}列', f'{col_pos}{target_column}列')
+                        else:
+                            error_msg = f'{col_pos}{error_msg}'
+                    
                     errors[idx] = error_msg
                 except Exception as e:
                     if idx >= len(errors):
                         errors.extend([''] * (idx - len(errors) + 1))
-                    errors[idx] = f"{target_column}列でURL検証エラー: {str(e)}"
+                    col_pos = get_column_position_text(main_data, target_column)
+                    errors[idx] = f"{col_pos}{target_column}列でURL検証エラー: {str(e)}"
     except Exception as e:
         # aiohttp関連のエラーの場合
         st.warning(f"WebサイトURL検証でエラーが発生しました: {str(e)}")
@@ -1490,7 +2081,8 @@ def validate_facility_location(main_data, facility_data):
             
             # 空欄でない場合のみチェック
             if value and value not in facility_names:
-                error_list.append("活動場所が施設情報に存在しません")
+                col_pos = get_column_position_text(main_data, '活動場所')
+                error_list.append(f"{col_pos}活動場所が施設情報に存在しません")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1522,7 +2114,8 @@ def validate_status_column(main_data):
                     value = ''
             
             if value not in valid_statuses:
-                error_list.append("ステータス列に無効な値が入力されています")
+                col_pos = get_column_position_text(main_data, 'ステータス')
+                error_list.append(f"{col_pos}ステータス列に無効な値が入力されています")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1584,7 +2177,8 @@ def validate_account_issue_date(main_data):
             if value:
                 conversion_result = convert_wareki_to_seireki_for_validation(value)
                 if conversion_result is False:
-                    error_list.append("ｱｶｳﾝﾄ発行年月列に変換できない値が入力されています")
+                    col_pos = get_column_position_text(main_data, 'ｱｶｳﾝﾄ発行年月')
+                    error_list.append(f"{col_pos}ｱｶｳﾝﾄ発行年月列に変換できない値が入力されています")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1617,9 +2211,11 @@ def validate_weekdays(main_data):
             try:
                 days = set(value.split(','))  # カンマで分割してセットに変換
                 if not days.issubset(valid_days):
-                    error_list.append("活動日_営業曜日列はカンマ区切りで入力してください")
+                    col_pos = get_column_position_text(main_data, target_column)
+                    error_list.append(f"{col_pos}活動日_営業曜日列はカンマ区切りで入力してください")
             except AttributeError:
-                error_list.append("活動日_営業曜日列はカンマ区切りで入力してください")
+                col_pos = get_column_position_text(main_data, target_column)
+                error_list.append(f"{col_pos}活動日_営業曜日列はカンマ区切りで入力してください")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1690,11 +2286,15 @@ def validate_business_hours(main_data):
         
         if start_value and not start_valid:
             if end_value and not end_valid:
-                error_list.append("開始+終了時間の形式が違います")
+                start_col_pos = get_column_position_text(main_data, start_column)
+                end_col_pos = get_column_position_text(main_data, end_column)
+                error_list.append(f"{start_col_pos}開始+{end_col_pos}終了時間の形式が違います")
             else:
-                error_list.append("開始時間の形式が違います")
+                start_col_pos = get_column_position_text(main_data, start_column)
+                error_list.append(f"{start_col_pos}開始時間の形式が違います")
         elif end_value and not end_valid:
-            error_list.append("終了時間の形式が違います")
+            end_col_pos = get_column_position_text(main_data, end_column)
+            error_list.append(f"{end_col_pos}終了時間の形式が違います")
         elif start_value and end_value and start_valid and end_valid:
             # 開始時間と終了時間の論理チェック
             start_minutes = time_to_minutes(start_value)
@@ -1702,7 +2302,9 @@ def validate_business_hours(main_data):
             
             if start_minutes is not None and end_minutes is not None:
                 if start_minutes >= end_minutes:
-                    error_list.append("開始時間と終了時間が同じまたは逆転しています")
+                    start_col_pos = get_column_position_text(main_data, start_column)
+                    end_col_pos = get_column_position_text(main_data, end_column)
+                    error_list.append(f"{start_col_pos}開始時間と{end_col_pos}終了時間が同じまたは逆転しています")
         
         errors.append(', '.join(error_list) if error_list else '')
     
@@ -1827,12 +2429,23 @@ def validate_import_excel_file(excel_file, skip_rows_count=2):
     Returns:
         tuple: (メインデータ, 差分検出用データ)
     """
+    import time
+    import streamlit as st
+    
+    # 開始時間を記録
+    start_time = time.time()
+    timing_info = []
+    
     try:
         # Excelファイルを読み込んでシート情報を取得
+        sheet_info_start = time.time()
         wb = pd.ExcelFile(excel_file)
         sheet_names = wb.sheet_names
+        sheet_info_time = time.time() - sheet_info_start
+        timing_info.append(f"シート情報取得: {sheet_info_time:.3f}秒")
         
         # シート数の検証
+        validation_start = time.time()
         if len(sheet_names) > 2:
             raise ValueError("シート数が2より多いため、どのシートをメインデータにするかが特定できません")
         
@@ -1852,13 +2465,23 @@ def validate_import_excel_file(excel_file, skip_rows_count=2):
         if original_sheet is None:
             raise ValueError("'original'という名前のシートが見つかりません")
         
+        validation_time = time.time() - validation_start
+        timing_info.append(f"シート検証: {validation_time:.3f}秒")
+        
         # メインデータを読み込み（指定された行数をスキップ）
+        main_data_start = time.time()
         main_data = pd.read_excel(excel_file, sheet_name=main_sheet, skiprows=list(range(1, skip_rows_count + 1)))
+        main_data_time = time.time() - main_data_start
+        timing_info.append(f"メインデータ読み込み: {main_data_time:.3f}秒")
         
         # 差分検出用データを読み込み（指定された行数をスキップ）
+        original_data_start = time.time()
         original_data = pd.read_excel(excel_file, sheet_name=original_sheet, skiprows=list(range(1, skip_rows_count + 1)))
+        original_data_time = time.time() - original_data_start
+        timing_info.append(f"差分検出用データ読み込み: {original_data_time:.3f}秒")
         
         # 基本的な検証
+        basic_validation_start = time.time()
         if main_data.empty:
             raise ValueError("メインデータが空です")
         if original_data.empty:
@@ -1869,6 +2492,42 @@ def validate_import_excel_file(excel_file, skip_rows_count=2):
         if len(original_data.columns) == 0:
             raise ValueError("差分検出用データに列が存在しません")
         
+        basic_validation_time = time.time() - basic_validation_start
+        timing_info.append(f"基本検証: {basic_validation_time:.3f}秒")
+        
+        # 削除された行の検証（B列：スラッグで比較）
+        deletion_check_start = time.time()
+        if len(main_data.columns) >= 2 and len(original_data.columns) >= 2:
+            # B列（インデックス1）がスラッグ列
+            main_slugs = set(main_data.iloc[:, 1].dropna().astype(str))
+            original_slugs = set(original_data.iloc[:, 1].dropna().astype(str))
+            
+            # 差分検出用データに存在するが、メインデータに存在しないスラッグを検出
+            deleted_slugs = original_slugs - main_slugs
+            
+            if deleted_slugs:
+                # 削除されたスラッグに対応する行データを取得
+                deleted_rows = original_data[original_data.iloc[:, 1].astype(str).isin(deleted_slugs)]
+                
+                st.warning(f"⚠️ 以下の{len(deleted_slugs)}件のデータがメインデータから削除されています：")
+                
+                # 削除されたデータを表形式で表示
+                if not deleted_rows.empty:
+                    with st.expander(f"削除されたデータの詳細 ({len(deleted_rows)}件)"):
+                        st.dataframe(deleted_rows, use_container_width=True)
+        
+        deletion_check_time = time.time() - deletion_check_start
+        timing_info.append(f"削除行検証: {deletion_check_time:.3f}秒")
+        
+        total_time = time.time() - start_time
+        timing_info.append(f"全体処理時間: {total_time:.3f}秒")
+        
+        # デバッグモード時に処理時間を表示
+        if st.session_state.get('debug_mode', False):
+            st.write("**⏱️ インポート用Excelファイル読み込み処理時間:**")
+            for timing in timing_info:
+                st.write(f"  - {timing}")
+        
         return main_data, original_data
         
     except Exception as e:
@@ -1876,22 +2535,16 @@ def validate_import_excel_file(excel_file, skip_rows_count=2):
 
 def show_import_data_page():
     """インポートデータ作成ページの表示"""
-    log_session_state_change("page_loaded", {'page': 'import_data'})
+    # st.header("インポートデータ作成", divider='orange')
     
-    st.header("インポートデータ作成")
-    
-    # セッション状態のデバッグ情報を表示
-    show_session_state_debug()
-    
-    # デバッグモード時のみ表示される情報
     if st.session_state.debug_mode:
-        st.write("### デバッグ情報")
         st.write("デバッグモードが有効です")
     
-    st.write("### ファイルのアップロード")
+    st.header('STEP1：ファイルのアップロード', divider='orange')
     
     # 修正済みExcelファイルのアップロード
-    excel_file = st.file_uploader("修正済みExcelファイルを選択してください", type=['xlsx'], key="import_excel")
+    st.write("**1. 修正済みExcelファイル（xlsx）をアップロードしてください。**")
+    excel_file = st.file_uploader("例: 【北九州市様】育児サークル等修正用データ（1月分）_修正済み.xlsx", type=['xlsx'], key="import_excel")
     
     # スキップする行数の指定
     skip_rows = st.number_input("スキップする行数", min_value=0, max_value=10, value=2, 
@@ -1903,13 +2556,23 @@ def show_import_data_page():
     if excel_file:
         try:
             # ファイルが変更された場合のみセッション状態をリセット
+            import time
+            session_reset_start = time.time()
             if check_file_changed(excel_file, 'excel'):
                 reset_import_session_state()
+            session_reset_time = time.time() - session_reset_start
             
             # Excelファイルの検証と読み込み
+            overall_start = time.time()
             main_data, original_data = validate_import_excel_file(excel_file, skip_rows)
+            overall_time = time.time() - overall_start
             
             st.success("Excelファイルが正常に読み込まれました")
+            
+            # デバッグモード時に追加情報を表示
+            if st.session_state.get('debug_mode', False):
+                st.write(f"**🔄 セッション状態リセット時間:** {session_reset_time:.3f}秒")
+                st.write(f"**⏱️ 全体処理時間:** {overall_time:.3f}秒")
             
             col1, col2 = st.columns(2)
             with col1:
@@ -1928,19 +2591,31 @@ def show_import_data_page():
             st.error(f"Excelファイルの予期せぬエラー: {str(e)}")
     
     # 施設情報CSVファイルのアップロード（データ検証用）
-    facility_csv_file = st.file_uploader("施設情報CSVファイルを選択してください", type=['csv'], key="import_facility")
+    st.write("**2. 施設情報（csv）をアップロードしてください。**")
+    facility_csv_file = st.file_uploader("例: kitakyushu-city_facility_00000000000.csv", type=['csv'], key="import_facility")
     facility_data = None
     
     if facility_csv_file:
         try:
             # ファイルが変更された場合のみセッション状態をリセット
+            import time
+            session_reset_start = time.time()
             if check_file_changed(facility_csv_file, 'facility'):
                 reset_import_session_state()
+            session_reset_time = time.time() - session_reset_start
             
             # 施設情報CSVファイルの検証と読み込み（専用の検証関数を使用）
+            overall_start = time.time()
             facility_data, facility_encoding, facility_debug_info = validate_facility_csv_file(facility_csv_file)
+            overall_time = time.time() - overall_start
             
             st.success(f"施設情報CSVファイルが正常に読み込まれました（エンコーディング: {facility_encoding}）")
+            
+            # デバッグモード時に追加情報を表示
+            if st.session_state.get('debug_mode', False):
+                st.write(f"**🔄 セッション状態リセット時間:** {session_reset_time:.3f}秒")
+                st.write(f"**⏱️ 全体処理時間:** {overall_time:.3f}秒")
+            
             with st.expander("施設情報データを確認する"):
                 st.dataframe(facility_data, use_container_width=True)
                 
@@ -1956,19 +2631,31 @@ def show_import_data_page():
             st.error(f"施設情報CSVファイルの予期せぬエラー: {str(e)}")
     
     # ユーザーデータCSVファイルのアップロード（インポートデータ作成用）
-    user_csv_file = st.file_uploader("ユーザーデータCSVファイルを選択してください", type=['csv'], key="import_user")
+    st.write("**3. ユーザーデータ（csv）をアップロードしてください。**")
+    user_csv_file = st.file_uploader("例: kitakyushu-city_user_00000000000.csv", type=['csv'], key="import_user")
     user_data = None
     
     if user_csv_file:
         try:
             # ファイルが変更された場合のみセッション状態をリセット
+            import time
+            session_reset_start = time.time()
             if check_file_changed(user_csv_file, 'user'):
                 reset_import_session_state()
+            session_reset_time = time.time() - session_reset_start
             
             # ユーザーデータCSVファイルの検証と読み込み
+            overall_start = time.time()
             user_data, user_encoding, user_debug_info = validate_csv_file(user_csv_file)
+            overall_time = time.time() - overall_start
             
             st.success(f"ユーザーデータCSVファイルが正常に読み込まれました（エンコーディング: {user_encoding}）")
+            
+            # デバッグモード時に追加情報を表示
+            if st.session_state.get('debug_mode', False):
+                st.write(f"**🔄 セッション状態リセット時間:** {session_reset_time:.3f}秒")
+                st.write(f"**⏱️ 全体処理時間:** {overall_time:.3f}秒")
+            
             with st.expander("ユーザーデータを確認する"):
                 st.dataframe(user_data, use_container_width=True)
                 
@@ -1994,7 +2681,9 @@ def show_import_data_page():
     if all_data_ready:
         st.success("全てのファイルが正常に読み込まれました。データ検証を開始できます。")
         
-                # 自治体名の入力フィールド
+        st.header('STEP2：データ検証の実行', divider='orange')
+        
+        # 自治体名の入力フィールド
         municipality = st.text_input("自治体名", value="北九州市", help="インポートファイル名に使用される自治体名を入力してください", key="import_municipality")
         
         # 検証項目の選択
@@ -2129,7 +2818,7 @@ def show_import_data_page():
                     st.dataframe(validated_data, use_container_width=True)
                 
                 # データ整形とインポートファイル作成
-                st.write("### インポートデータ作成")
+                st.header('STEP3：インポートデータ作成', divider='orange')
                 
                 # インポートデータ作成用のコールバック関数
                 def create_import_data_callback():
@@ -2259,8 +2948,7 @@ def show_import_data_page():
                             st.caption("📋 管理画面から手動でゴミ箱に移動する作業が必要です。")
                         
                         # インポート用CSVダウンロードセクションの見出し
-                        st.markdown("---")
-                        st.subheader("📥 インポート用CSVファイルダウンロード")
+                        st.header('STEP4：ファイルダウンロード', divider='orange')
                         st.write("作成されたインポート用CSVファイルをダウンロードしてください。")
                         
                         # 各ファイルのダウンロードボタンを表示
@@ -2271,43 +2959,43 @@ def show_import_data_page():
                                 display_data = data['display_data']  # 表示用（修正対象列含む）
                                 download_data = data['download_data']  # ダウンロード用（修正対象列除外）
                                 
+                                # ファイル内容のプレビュー（表示用データを使用）
+                                with st.expander(f"📋 {filename} の内容を確認"):
+                                    st.dataframe(display_data, use_container_width=True)
+                                    st.info(f"行数: {len(display_data)}, 列数: {len(display_data.columns)}")
+                                    st.caption("💡 「修正対象列」は内容確認用の列で、ダウンロードファイルには含まれません。")
+                                
                                 # CSVファイルとして出力（ダウンロード用データを使用）
                                 csv_output = io.StringIO()
                                 download_data.to_csv(csv_output, index=False, encoding='utf-8-sig')
                                 csv_data = csv_output.getvalue().encode('utf-8-sig')
                                 
                                 st.download_button(
-                                    label=f"📁 {filename}",
+                                    label=f"{filename}をダウンロード",
                                     data=csv_data,
                                     file_name=filename,
                                     mime="text/csv",
                                     key=f"download_{filename}"
                                 )
-                                
-                                # ファイル内容のプレビュー（表示用データを使用）
-                                with st.expander(f"📋 {filename} の内容を確認"):
-                                    st.dataframe(display_data, use_container_width=True)
-                                    st.info(f"行数: {len(display_data)}, 列数: {len(display_data.columns)}")
-                                    st.caption("💡 「修正対象列」は内容確認用の列で、ダウンロードファイルには含まれません。")
                             else:
                                 # 通常のファイルの場合
+                                # ファイル内容のプレビュー
+                                with st.expander(f"📋 {filename} の内容を確認"):
+                                    st.dataframe(data, use_container_width=True)
+                                    st.info(f"行数: {len(data)}, 列数: {len(data.columns)}")
+                                
                                 # CSVファイルとして出力
                                 csv_output = io.StringIO()
                                 data.to_csv(csv_output, index=False, encoding='utf-8-sig')
                                 csv_data = csv_output.getvalue().encode('utf-8-sig')
                                 
                                 st.download_button(
-                                    label=f"📁 {filename}",
+                                    label=f"{filename}をダウンロード",
                                     data=csv_data,
                                     file_name=filename,
                                     mime="text/csv",
                                     key=f"download_{filename}"
                                 )
-                                
-                                # ファイル内容のプレビュー
-                                with st.expander(f"📋 {filename} の内容を確認"):
-                                    st.dataframe(data, use_container_width=True)
-                                    st.info(f"行数: {len(data)}, 列数: {len(data.columns)}")
 
                     else:
                         st.warning("作成対象のインポートデータがありませんでした。")
@@ -3188,7 +3876,7 @@ def create_modified_user_data(main_data, original_data, user_data):
     return modified_users_df, modified_row_indices
 
 def validate_facility_csv_file(csv_file):
-    """施設情報CSVファイルの検証と読み込みを行う
+    """施設情報CSVファイルの検証と読み込みを行う（最適化版）
     
     Args:
         csv_file: アップロードされた施設情報CSVファイル
@@ -3199,136 +3887,288 @@ def validate_facility_csv_file(csv_file):
     Raises:
         ValueError: 検証エラーが発生した場合
     """
-    # 基本的なCSV検証
-    facility_data, encoding, debug_info = validate_csv_file(csv_file)
+    import time
     
-    # 施設情報専用の検証
-    try:
-        # 必要な列の存在チェック
-        required_columns = ['施設名', '場所']
-        missing_columns = [col for col in required_columns if col not in facility_data.columns]
-        if missing_columns:
-            raise ValueError(f"施設情報データに以下の列が存在しません: {', '.join(missing_columns)}")
-        
-        # 施設名の重複チェック
-        # NaN値も含めて重複をチェックするため、文字列に変換してから処理
-        facility_data_str = facility_data.copy()
-        facility_data_str['施設名_str'] = facility_data_str['施設名'].fillna('').astype(str)
-        
-        # 重複している施設名を検出
-        duplicated_mask = facility_data_str['施設名_str'].duplicated(keep=False)
-        duplicate_counts = facility_data_str['施設名_str'].value_counts()
-        
-        # 2回以上出現する施設名を取得
-        facility_duplicates = duplicate_counts[duplicate_counts > 1].index.tolist()
-        
-        if len(facility_duplicates) > 0:
-            error_message = "施設情報データ内で重複している施設名が検出されました:\n\n"
-            for facility_name_str in facility_duplicates:
-                # 重複している施設名のすべての行を取得
-                if facility_name_str == '':
-                    # 空欄・NaN値の場合
-                    all_duplicate_rows = facility_data_str[facility_data_str['施設名_str'] == '']
-                    display_name = "（空欄）"
-                else:
-                    all_duplicate_rows = facility_data_str[facility_data_str['施設名_str'] == facility_name_str]
-                    display_name = facility_name_str
-                
-                error_message += f"【施設名: {display_name}】\n"
-                error_message += f"  重複している行数: {len(all_duplicate_rows)}行\n"
-                for idx, row in all_duplicate_rows.iterrows():
-                    location = row.get('場所', '不明')
-                    if pd.isna(location):
-                        location = '（空欄）'
-                    # CSVファイルの実際の行番号（ヘッダーを考慮して+2）
-                    csv_row_number = idx + 2
-                    error_message += f"  - CSV行{csv_row_number}: 場所=「{location}」\n"
-                error_message += "\n"
+    # 開始時間を記録
+    start_time = time.time()
+    debug_info = []
+    timing_info = []
+    
+    # ファイルの内容を一度だけ読み込む（最大サイズを制限）
+    file_read_start = time.time()
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+    file_content = csv_file.read(MAX_FILE_SIZE)
+    if len(file_content) == MAX_FILE_SIZE:
+        raise ValueError("ファイルサイズが制限を超えています（最大10MB）")
+    
+    file_read_time = time.time() - file_read_start
+    timing_info.append(f"ファイル読み込み: {file_read_time:.3f}秒")
+    
+    # chardetによるエンコーディング検出（処理時間短縮のため一時的にコメントアウト）
+    # detected_enc, confidence = detect_encoding(file_content)
+    # debug_info.append(f"chardetが検出したエンコーディング: {detected_enc} (信頼度: {confidence:.2f})")
+    
+    # 試行するエンコーディングの順序を決定（固定順序で高速化）
+    # encodings = [detected_enc] if detected_enc else []
+    # encodings.extend(['utf-8', 'shift-jis', 'cp932', 'euc-jp'])
+    # encodings = list(dict.fromkeys(encodings))
+    encodings = ['utf-8-sig', 'utf-8', 'shift-jis', 'cp932', 'euc-jp']
+    debug_info.append("エンコーディング検出をスキップし、固定順序で試行します（UTF-8 BOM対応）")
+    
+    encoding_start = time.time()
+    successful_encoding = None
+    
+    for encoding in encodings:
+        try:
+            encoding_try_start = time.time()
+            debug_info.append(f"エンコーディング {encoding} で試行中...")
             
-            error_message += "※ 上記の重複行のうち、不要な行を削除してから再度実行してください。"
-            raise ValueError(error_message)
-        
-        # 空欄チェック（施設名が空の行があるかチェック）
-        # 重複チェックで既に空欄が検出されている場合はスキップ
-        empty_facility_names = facility_data[facility_data['施設名'].isna() | (facility_data['施設名'] == '')]
-        if not empty_facility_names.empty and '' not in facility_duplicates:
-            error_message = "施設情報データに施設名が空欄の行が存在します:\n\n"
-            error_message += f"空欄の行数: {len(empty_facility_names)}行\n"
-            for idx, row in empty_facility_names.iterrows():
+            # まず一部のデータでテスト（先頭1000バイト）
+            sample_test_start = time.time()
+            sample_size = min(1000, len(file_content))
+            try:
+                sample = file_content[:sample_size].decode(encoding)
+            except UnicodeDecodeError:
+                # サンプルテストで失敗した場合、エラー処理付きで再試行
+                try:
+                    sample = file_content[:sample_size].decode(encoding, errors='ignore')
+                    debug_info.append(f"  → サンプルデコードでエラー文字を無視しました")
+                except:
+                    debug_info.append(f"  → サンプルデコードに失敗")
+                    continue
+            
+            sample_test_time = time.time() - sample_test_start
+            timing_info.append(f"サンプルテスト({encoding}): {sample_test_time:.3f}秒")
+            
+            if not sample.strip():
+                debug_info.append(f"  → サンプルデータが空です")
+                continue
+            
+            # 全体をデコード（エラー処理付き）
+            full_decode_start = time.time()
+            try:
+                decoded_content = file_content.decode(encoding)
+            except UnicodeDecodeError:
+                # エラー文字を無視してデコード
+                decoded_content = file_content.decode(encoding, errors='ignore')
+                debug_info.append(f"  → 全体デコードでエラー文字を無視しました")
+            
+            full_decode_time = time.time() - full_decode_start
+            timing_info.append(f"全体デコード({encoding}): {full_decode_time:.3f}秒")
+            
+            # CSVとしての基本検証
+            csv_parse_start = time.time()
+            df = pd.read_csv(io.StringIO(decoded_content))
+            csv_parse_time = time.time() - csv_parse_start
+            timing_info.append(f"CSV解析({encoding}): {csv_parse_time:.3f}秒")
+            
+            # データ品質の検証
+            validation_start = time.time()
+            if df.empty:
+                debug_info.append(f"  → データが空です")
+                continue
+            if len(df.columns) == 0:
+                debug_info.append(f"  → 列が存在しません")
+                continue
+            
+            # CSVファイルとしての基本的な構造確認のみ
+            if df.empty:
+                debug_info.append(f"  → データが空です")
+                continue
+            if len(df.columns) == 0:
+                debug_info.append(f"  → 列が存在しません")
+                continue
+            
+            validation_time = time.time() - validation_start
+            timing_info.append(f"データ検証({encoding}): {validation_time:.3f}秒")
+            
+            encoding_try_time = time.time() - encoding_try_start
+            timing_info.append(f"エンコーディング試行完了({encoding}): {encoding_try_time:.3f}秒")
+            
+            debug_info.append(f"  → 正常に読み込めました")
+            successful_encoding = encoding
+            break
+            
+        except UnicodeDecodeError:
+            debug_info.append(f"  → デコードエラー")
+            continue
+        except pd.errors.EmptyDataError:
+            debug_info.append(f"  → 空のCSVファイル")
+            raise ValueError("CSVファイルが空です")
+        except ValueError as e:
+            # 検証エラーは上位に伝播
+            raise e
+        except Exception as e:
+            debug_info.append(f"  → その他のエラー: {str(e)}")
+            continue
+    
+    if successful_encoding is None:
+        error_msg = "CSVファイルのエンコーディングを認識できません。以下のいずれかの形式で保存してください：UTF-8、Shift-JIS、CP932、EUC-JP"
+        if st.session_state.get('debug_mode', False):
+            error_msg += "\n\nデバッグ情報:\n" + "\n".join(debug_info)
+        raise ValueError(error_msg)
+    
+    encoding_total_time = time.time() - encoding_start
+    timing_info.append(f"エンコーディング処理合計: {encoding_total_time:.3f}秒")
+    
+    total_time = time.time() - start_time
+    timing_info.append(f"全体処理時間: {total_time:.3f}秒")
+    
+    # デバッグモード時に処理時間を表示
+    if st.session_state.get('debug_mode', False):
+        st.write("**⏱️ 施設情報CSVファイル読み込み処理時間:**")
+        for timing in timing_info:
+            st.write(f"  - {timing}")
+    
+    return df, successful_encoding, debug_info
+
+def validate_facility_data(df):
+    """施設情報データの追加検証を行う
+    
+    Args:
+        df (pd.DataFrame): 検証対象のデータフレーム
+    
+    Raises:
+        ValueError: 検証エラーが発生した場合
+    """
+    # 施設名の重複チェック
+    # NaN値も含めて重複をチェックするため、文字列に変換してから処理
+    facility_data_str = df.copy()
+    facility_data_str['施設名_str'] = facility_data_str['施設名'].fillna('').astype(str)
+    
+    # 重複している施設名を検出
+    duplicated_mask = facility_data_str['施設名_str'].duplicated(keep=False)
+    duplicate_counts = facility_data_str['施設名_str'].value_counts()
+    
+    # 2回以上出現する施設名を取得
+    facility_duplicates = duplicate_counts[duplicate_counts > 1].index.tolist()
+    
+    if len(facility_duplicates) > 0:
+        error_message = "施設情報データ内で重複している施設名が検出されました:\n\n"
+        for facility_name_str in facility_duplicates:
+            # 重複している施設名のすべての行を取得
+            if facility_name_str == '':
+                # 空欄・NaN値の場合
+                all_duplicate_rows = facility_data_str[facility_data_str['施設名_str'] == '']
+                display_name = "（空欄）"
+            else:
+                all_duplicate_rows = facility_data_str[facility_data_str['施設名_str'] == facility_name_str]
+                display_name = facility_name_str
+            
+            error_message += f"【施設名: {display_name}】\n"
+            error_message += f"  重複している行数: {len(all_duplicate_rows)}行\n"
+            for idx, row in all_duplicate_rows.iterrows():
                 location = row.get('場所', '不明')
                 if pd.isna(location):
                     location = '（空欄）'
                 # CSVファイルの実際の行番号（ヘッダーを考慮して+2）
                 csv_row_number = idx + 2
-                error_message += f"- CSV行{csv_row_number}: 場所=「{location}」\n"
-            
-            error_message += "\n※ 上記の空欄行を削除または施設名を入力してから再度実行してください。"
-            raise ValueError(error_message)
+                error_message += f"  - CSV行{csv_row_number}: 場所=「{location}」\n"
+            error_message += "\n"
         
-        return facility_data, encoding, debug_info
+        error_message += "※ 上記の重複行のうち、不要な行を削除してから再度実行してください。"
+        raise ValueError(error_message)
+    
+    # 空欄チェック（施設名が空の行があるかチェック）
+    # 重複チェックで既に空欄が検出されている場合はスキップ
+    empty_facility_names = df[df['施設名'].isna() | (df['施設名'] == '')]
+    if not empty_facility_names.empty and '' not in facility_duplicates:
+        error_message = "施設情報データに施設名が空欄の行が存在します:\n\n"
+        error_message += f"空欄の行数: {len(empty_facility_names)}行\n"
+        for idx, row in empty_facility_names.iterrows():
+            location = row.get('場所', '不明')
+            if pd.isna(location):
+                location = '（空欄）'
+            # CSVファイルの実際の行番号（ヘッダーを考慮して+2）
+            csv_row_number = idx + 2
+            error_message += f"- CSV行{csv_row_number}: 場所=「{location}」\n"
         
-    except ValueError:
-        # ValueError は再発生させる
-        raise
-    except Exception as e:
-        raise ValueError(f"施設情報CSVファイルの検証中にエラーが発生しました: {str(e)}")
+        error_message += "\n※ 上記の空欄行を削除または施設名を入力してから再度実行してください。"
+        raise ValueError(error_message)
 
-def main():
+def show_sidebar_usage_guide(selected_function):
+    """選択された機能に応じてサイドバーに使い方を表示"""
+    st.sidebar.markdown("---")
+    
+    if selected_function == "データ修正用エクセル作成":
+        st.sidebar.markdown("### 📊 データ修正用エクセル作成の使い方")
+        st.sidebar.markdown("""
+        1. 育児サークルCSVファイルをアップロード
+        2. 施設情報CSVファイルをアップロード
+        3. 先月分のデータ（Excelファイル）をアップロード
+        4. 自治体名を入力（デフォルト：北九州市様）
+        5. 「処理開始」ボタンをクリック
+        6. 処理が完了したら「処理済みファイルをダウンロード」ボタンが表示される
+        7. ダウンロードしたExcelファイルで修正作業を行う
+        """)
+    else:
+        st.sidebar.markdown("### 📋 インポートデータ作成の使い方")
+        st.sidebar.markdown("""
+        1. 修正済みExcelファイルをアップロード
+        2. 必要に応じてスキップする行数を調整
+        3. 施設情報CSVファイルとユーザーデータCSVファイルをアップロード
+        4. 「データ検証開始」ボタンをクリック
+        5. 検証結果を確認
+           - エラーがある場合：エラーを修正してから再度検証
+           - エラーが0件の場合：次のステップに進む
+        6. **エラーが0件の場合のみ**「インポートデータ作成開始」ボタンをクリック
+        7. インポートデータが作成されたら、各ファイルをダウンロード
+        """)
+
+def show_sidebar_footer():
+    """サイドバーの最下段にデバッグモードとバージョン情報を表示"""
+    st.sidebar.markdown("---")
+    
+    # デバッグモードの切り替え
+    st.session_state.debug_mode = st.sidebar.checkbox(
+        "🔧 デバッグモード", 
+        value=st.session_state.debug_mode,
+        help="処理時間やセッション状態の詳細情報を表示します"
+    )
+    
+    # バージョン情報（控えめに表示）
+    st.sidebar.markdown("---")
+    st.sidebar.caption("v2.4 - 2025/07/16")
+
+def setup_page_config():
+    """ページの基本設定を行う"""
+    st.set_page_config(
+        page_title="育児サークル情報処理ツール",
+        page_icon="👶",
+        layout="wide"
+    )
+
+def setup_session_state():
+    """セッション状態の初期化"""
     initialize_session_state()
     log_session_state_change("app_started", {})
+
+def main():
+    """メイン関数"""
+    setup_page_config()
+    setup_session_state()
+    show_sidebar_chat()
     
-    # サイドバーにデバッグモードの切り替えと使い方を追加
-    with st.sidebar:
-        st.session_state.debug_mode = st.checkbox("デバッグモード", value=st.session_state.debug_mode)
-        
-        # バージョン情報（控えめに表示）
-        st.markdown("---")
-        st.caption("v2.2 - 2025/07/09")
+    st.title("育児サークル情報処理ツール")
     
-    st.title("育児サークル情報処理アプリ")
+    st.header("はじめに", divider='orange')    
+    st.write('**←ご利用の手順についてはサイドバーを参照してください。**')
     
-    # タブの作成
-    tab1, tab2 = st.tabs([
-        "データ修正用エクセル作成",
-        "インポートデータ作成"
-    ])
+    # 機能選択タブ（パフォーマンス向上のため）
+    tab1, tab2 = st.tabs(["📊 データ修正用エクセル作成", "📋 インポートデータ作成"])
     
-    # タブの内容を表示
     with tab1:
-        # データ修正用エクセル作成タブの使い方をサイドバーに表示
-        with st.sidebar:
-            st.markdown("---")
-            st.markdown("### 📊 データ修正用エクセル作成の使い方")
-            st.markdown("""
-            1. 育児サークルCSVファイルをアップロード
-            2. 施設情報CSVファイルをアップロード
-            3. 先月分のデータ（Excelファイル）をアップロード
-            4. 自治体名を入力（デフォルト：北九州市様）
-            5. 「処理開始」ボタンをクリック
-            6. 処理が完了したら「処理済みファイルをダウンロード」ボタンが表示される
-            7. ダウンロードしたExcelファイルで修正作業を行う
-            """)
-        
-        show_modification_excel_page()
+        # サイドバーの使い方を更新
+        show_sidebar_usage_guide("データ修正用エクセル作成")
+        show_excel_creation_page()
     
     with tab2:
-        # インポートデータ作成タブの使い方をサイドバーに表示
-        with st.sidebar:
-            st.markdown("---")
-            st.markdown("### 📋 インポートデータ作成の使い方")
-            st.markdown("""
-            1. 修正済みExcelファイルをアップロード
-            2. 必要に応じてスキップする行数を調整
-            3. 施設情報CSVファイルとユーザーデータCSVファイルをアップロード
-            4. 「データ検証開始」ボタンをクリック
-            5. 検証結果を確認
-               - エラーがある場合：エラーを修正してから再度検証
-               - エラーが0件の場合：次のステップに進む
-            6. **エラーが0件の場合のみ**「インポートデータ作成開始」ボタンをクリック
-            7. インポートデータが作成されたら、各ファイルをダウンロード
-            """)
-        
+        # サイドバーの使い方を更新
+        show_sidebar_usage_guide("インポートデータ作成")
         show_import_data_page()
+    
+    # サイドバーの最下段にデバッグモードとバージョン情報を表示
+    show_sidebar_footer()
 
 if __name__ == "__main__":
     main() 
