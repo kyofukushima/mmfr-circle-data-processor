@@ -1090,10 +1090,18 @@ def show_sidebar_chat():
             context_time = time.time() - context_start
             
             # チャット応答を生成
-            with st.sidebar.spinner("回答を生成中..."):
-                chat_start = time.time()
-                response = chat_with_openai(client, user_input, context)
-                chat_time = time.time() - chat_start
+            # Streamlit 1.30.0以降でst.sidebar.spinner()が利用可能
+            try:
+                with st.sidebar.spinner("回答を生成中..."):
+                    chat_start = time.time()
+                    response = chat_with_openai(client, user_input, context)
+                    chat_time = time.time() - chat_start
+            except AttributeError:
+                # 古いStreamlitバージョンの場合は通常のspinnerを使用
+                with st.spinner("回答を生成中..."):
+                    chat_start = time.time()
+                    response = chat_with_openai(client, user_input, context)
+                    chat_time = time.time() - chat_start
             
             # チャット履歴に追加
             history_start = time.time()
@@ -4128,6 +4136,46 @@ def show_sidebar_footer():
         value=st.session_state.debug_mode,
         help="処理時間やセッション状態の詳細情報を表示します"
     )
+    
+    # デバッグモード時にライブラリバージョン情報を表示
+    if st.session_state.debug_mode:
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**📚 ライブラリバージョン情報:**")
+        
+        # 主要ライブラリのバージョンを取得
+        try:
+            import streamlit as st_lib
+            import pandas as pd_lib
+            import openpyxl
+            import chardet
+            import aiohttp
+            import requests
+            import sys
+            
+            # バージョン情報を取得
+            versions = {
+                "Python": sys.version.split()[0],
+                "Streamlit": st_lib.__version__,
+                "pandas": pd_lib.__version__,
+                "openpyxl": openpyxl.__version__,
+                "chardet": chardet.__version__,
+                "aiohttp": aiohttp.__version__,
+                "requests": requests.__version__,
+            }
+            
+            # OpenAIライブラリのバージョンも取得（存在する場合）
+            try:
+                from openai import __version__ as openai_version
+                versions["openai"] = openai_version
+            except ImportError:
+                versions["openai"] = "未インストール"
+            
+            # バージョン情報を表示
+            for lib, version in versions.items():
+                st.sidebar.text(f"  {lib}: {version}")
+                
+        except Exception as e:
+            st.sidebar.error(f"バージョン情報の取得に失敗: {str(e)}")
     
     # バージョン情報（控えめに表示）
     st.sidebar.markdown("---")
