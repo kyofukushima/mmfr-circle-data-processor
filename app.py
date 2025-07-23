@@ -294,7 +294,7 @@ def add_account_columns(circle_data, last_month_data):
     return circle_data, process_df
 
 def validate_csv_file(csv_file):
-    """CSVファイルの検証を行う（セキュリティと品質を維持した最適化版）"""
+    """CSVファイルの検証を行う（高速化版）"""
     import time
     
     # 開始時間を記録
@@ -312,16 +312,10 @@ def validate_csv_file(csv_file):
     file_read_time = time.time() - file_read_start
     timing_info.append(f"ファイル読み込み: {file_read_time:.3f}秒")
     
-    # chardetによるエンコーディング検出（処理時間短縮のため一時的にコメントアウト）
-    # detected_enc, confidence = detect_encoding(file_content)
-    # debug_info.append(f"chardetが検出したエンコーディング: {detected_enc} (信頼度: {confidence:.2f})")
-    
-    # 試行するエンコーディングの順序を決定（固定順序で高速化）
-    # encodings = [detected_enc] if detected_enc else []
-    # encodings.extend(['utf-8', 'shift-jis', 'cp932', 'euc-jp'])
-    # encodings = list(dict.fromkeys(encodings))
-    encodings = ['utf-8-sig', 'utf-8', 'shift-jis', 'cp932', 'euc-jp']
-    debug_info.append("エンコーディング検出をスキップし、固定順序で試行します（UTF-8 BOM対応）")
+    # 高速エンコーディング検出（最も一般的なものを優先）
+    encodings = ['utf-8-sig', 'utf-8']  # まずUTF-8系を試行
+    japanese_encodings = ['shift-jis', 'cp932', 'euc-jp']  # 日本語エンコーディングは必要時のみ
+    debug_info.append("高速化のため、UTF-8系を優先して試行します")
     
     encoding_start = time.time()
     successful_encoding = None
@@ -450,9 +444,9 @@ def validate_excel_file(excel_file):
     timing_info = []
     
     try:
-        # Excelファイルを読み込む（2,3行目をスキップ）
+        # Excelファイルを読み込む（2,3行目をスキップ、高速化オプション付き）
         excel_read_start = time.time()
-        df = pd.read_excel(excel_file, skiprows=[1,2])
+        df = pd.read_excel(excel_file, skiprows=[1,2], engine='openpyxl')
         excel_read_time = time.time() - excel_read_start
         timing_info.append(f"Excelファイル読み込み: {excel_read_time:.3f}秒")
         
@@ -620,7 +614,7 @@ def setup_conditional_formatting(worksheet):
         {
             'name': 'スラッグの差分検出',
             'description': 'スラッグが空、または入力されているがoriginalに見つからないものを検出',
-            'formula': 'OR($B1="",ISERROR(MATCH($B1,INDIRECT("original!B1:B1048576"),0)))',
+            'formula': 'AND($B1<>"",ISERROR(MATCH($B1,INDIRECT("original!B:B"),0)))',
             'range': 'B1:B1048576',
             'style': red_style
         },
@@ -635,7 +629,7 @@ def setup_conditional_formatting(worksheet):
          {
              'name': '追加行の検出',
              'description': '入力されているスラッグがoriginalに見つからないおよびサークル名がoriginalに見つからない',
-             'formula': 'OR(ISERROR(MATCH($B1,INDIRECT("original!B1:B1048576"),0)),ISERROR(MATCH($C1,INDIRECT("original!C1:C1048576"),0)))',
+             'formula': 'ISBLANK($B1)',
              'range': 'A1:ZZ1048576',
              'style': green_style
          }
@@ -1040,33 +1034,43 @@ def show_sidebar_chat():
             recent_chats = st.session_state.chat_history[-5:]
             
             for i, chat in enumerate(recent_chats):
-                # ユーザーの質問（ユーザーアイコン付き）
-                user_icon = get_user_icon()
-                
+                import re
                 import html
-                escaped_user = html.escape(chat['user'])
-                st.sidebar.markdown(f"""
-                <div style="background-color: #f0f2f6; padding: 8px; border-radius: 8px; margin-bottom: 5px; display: flex; align-items: flex-start;">
-                    <div style="margin-right: 8px; font-size: 20px;">{user_icon}</div>
-                    <div style="flex: 1;">
-                        <small style="color: #666;">🕐 {chat['timestamp']}</small><br>
-                        <strong>質問:</strong> {escaped_user}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
                 
-                # AIの回答（ロボットアイコン付き）
-                robot_icon = get_robot_icon()
+                # ユーザーの質問を表示（HTMLタグを除去してエスケープ）
+                cleaned_user = re.sub(r'<[^>]+>', '', chat['user'])
                 
-                escaped_assistant = html.escape(chat['assistant'])
-                st.sidebar.markdown(f"""
-                <div style="background-color: #e8f4f8; padding: 8px; border-radius: 8px; margin-bottom: 10px; display: flex; align-items: flex-start;">
-                    <div style="margin-right: 8px; font-size: 20px;">{robot_icon}</div>
-                    <div style="flex: 1;">
-                        {escaped_assistant}
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
+                # st.chat_messageを使用してユーザーメッセージを表示
+                with st.sidebar.chat_message("user", avatar="👤"):
+                    st.caption(f"🕐 {chat['timestamp']}")
+                    st.write(cleaned_user)
+                
+                # AIの回答を表示（HTMLタグを除去してエスケープ）
+                cleaned_assistant = re.sub(r'<[^>]+>', '', chat['assistant'])
+                
+                # カスタム画像を使用してアシスタントメッセージを表示
+                if os.path.exists("img/bot.png"):
+                    # カスタム画像がある場合は、PIL Imageとして読み込み
+                    try:
+                        from PIL import Image
+                        bot_image = Image.open("img/bot.png")
+                        with st.sidebar.chat_message("assistant", avatar=bot_image):
+                            st.write(cleaned_assistant)
+                    except ImportError:
+                        # PILがない場合は絵文字を使用
+                        with st.sidebar.chat_message("assistant", avatar="🤖"):
+                            st.write(cleaned_assistant)
+                    except Exception:
+                        # 画像読み込みエラーの場合は絵文字を使用
+                        with st.sidebar.chat_message("assistant", avatar="🤖"):
+                            st.write(cleaned_assistant)
+                else:
+                    # 画像ファイルがない場合は絵文字を使用
+                    with st.sidebar.chat_message("assistant", avatar="🤖"):
+                        st.write(cleaned_assistant)
+    
+    # 処理中の状態表示用プレースホルダー
+    status_placeholder = st.sidebar.empty()
     
     # チャット入力（履歴の下に配置）
     user_input = st.sidebar.text_area(
@@ -1084,15 +1088,15 @@ def show_sidebar_chat():
             # 全体処理時間の測定開始
             overall_start = time.time()
             
-            # コードベースの文脈を取得
-            context_start = time.time()
-            context = get_codebase_context()
-            context_time = time.time() - context_start
-            
-            # チャット応答を生成
-            # with st.sidebar: 記法を使用してサイドバー内でspinnerを表示
-            with st.sidebar:
+            # 処理中の表示（spinner形式）と実際の処理を同時実行
+            with status_placeholder:
                 with st.spinner("回答を生成中..."):
+                    # コードベースの文脈を取得
+                    context_start = time.time()
+                    context = get_codebase_context()
+                    context_time = time.time() - context_start
+                    
+                    # チャット応答を生成
                     chat_start = time.time()
                     response = chat_with_openai(client, user_input, context)
                     chat_time = time.time() - chat_start
@@ -1108,6 +1112,9 @@ def show_sidebar_chat():
             
             # 全体処理時間
             overall_time = time.time() - overall_start
+            
+            # 処理完了後にステータス表示をクリア
+            status_placeholder.empty()
             
             # デバッグモード時に全体の処理時間を表示
             if st.session_state.get('debug_mode', False):
@@ -1314,7 +1321,7 @@ def reset_import_session_state():
         del st.session_state.already_issued_users
 
 def check_file_changed(file, file_type):
-    """ファイルが変更されたかチェックし、変更された場合のみセッション状態をリセット
+    """ファイルが変更されたかチェックし、変更された場合のみセッション状態をリセット（高速化版）
     
     Args:
         file: アップロードされたファイル
@@ -1326,28 +1333,34 @@ def check_file_changed(file, file_type):
     if file is None:
         return False
     
-    # ファイルの内容からハッシュを生成
-    file_content = file.read()
-    file.seek(0)  # ファイルポインタを先頭に戻す
-    file_hash = hashlib.md5(file_content).hexdigest()
+    # ファイルサイズとファイル名の組み合わせで簡易チェック（高速化）
+    file_info = f"{file.name}_{file.size}"
     
-    # 前回のハッシュと比較
-    previous_hash = st.session_state.uploaded_files_hash.get(file_type)
+    # 前回の情報と比較
+    previous_info = st.session_state.uploaded_files_hash.get(file_type)
     
-    if previous_hash != file_hash:
-        # ファイルが変更された場合
-        st.session_state.uploaded_files_hash[file_type] = file_hash
+    if previous_info != file_info:
+        # ファイルが変更された場合のみ、ハッシュを計算
+        file_content = file.read()
+        file.seek(0)  # ファイルポインタを先頭に戻す
+        file_hash = hashlib.md5(file_content).hexdigest()
+        
+        # ハッシュとファイル情報を保存
+        st.session_state.uploaded_files_hash[file_type] = file_info
+        st.session_state.uploaded_files_hash[f"{file_type}_hash"] = file_hash
+        
         log_session_state_change(f"{file_type}_file_changed", {
             'filename': file.name,
-            'previous_hash': previous_hash,
-            'new_hash': file_hash
+            'size': file.size,
+            'previous_info': previous_info,
+            'new_info': file_info
         })
         return True
     else:
         # ファイルが変更されていない場合
         log_session_state_change(f"{file_type}_file_unchanged", {
             'filename': file.name,
-            'hash': file_hash
+            'info': file_info
         })
         return False
 
@@ -2473,17 +2486,23 @@ def validate_import_excel_file(excel_file, skip_rows_count=2):
         validation_time = time.time() - validation_start
         timing_info.append(f"シート検証: {validation_time:.3f}秒")
         
-        # メインデータを読み込み（指定された行数をスキップ）
-        main_data_start = time.time()
-        main_data = pd.read_excel(excel_file, sheet_name=main_sheet, skiprows=list(range(1, skip_rows_count + 1)))
-        main_data_time = time.time() - main_data_start
-        timing_info.append(f"メインデータ読み込み: {main_data_time:.3f}秒")
+        # 高速化：両シートを同時に読み込み
+        excel_read_start = time.time()
+        skip_rows_list = list(range(1, skip_rows_count + 1))
         
-        # 差分検出用データを読み込み（指定された行数をスキップ）
-        original_data_start = time.time()
-        original_data = pd.read_excel(excel_file, sheet_name=original_sheet, skiprows=list(range(1, skip_rows_count + 1)))
-        original_data_time = time.time() - original_data_start
-        timing_info.append(f"差分検出用データ読み込み: {original_data_time:.3f}秒")
+        # 辞書形式で複数シートを一度に読み込み
+        all_sheets = pd.read_excel(
+            excel_file, 
+            sheet_name=[main_sheet, original_sheet], 
+            skiprows=skip_rows_list,
+            engine='openpyxl'
+        )
+        
+        main_data = all_sheets[main_sheet]
+        original_data = all_sheets[original_sheet]
+        
+        excel_read_time = time.time() - excel_read_start
+        timing_info.append(f"Excel両シート読み込み: {excel_read_time:.3f}秒")
         
         # 基本的な検証
         basic_validation_start = time.time()
@@ -2810,11 +2829,21 @@ def show_import_data_page():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
                 
-            else:
-                st.success("データ検証が完了しました。エラーは見つかりませんでした。")
+                # エラーを無視してインポートデータ作成に進むボタン
+                st.warning("⚠️ エラーがある状態でインポートデータを作成すると、システムに不具合が生じる可能性があります。")
+                if st.button("⚠️ エラーを無視してインポートデータ作成に進む", key="ignore_errors_and_proceed", type="secondary"):
+                    st.session_state.force_import_creation = True
+                    # st.rerun()
+            
+            # エラーがない場合、またはエラーを無視する場合にインポートデータ作成を表示
+            if error_count == 0 or st.session_state.get('force_import_creation', False):
+                if error_count == 0:
+                    st.success("データ検証が完了しました。エラーは見つかりませんでした。")
+                else:
+                    st.info("エラーを無視してインポートデータ作成を実行します。")
                 
-                # バルーンは一度だけ表示
-                if not st.session_state.get('balloons_shown', False):
+                # バルーンは一度だけ表示（エラーがない場合のみ）
+                if error_count == 0 and not st.session_state.get('balloons_shown', False):
                     st.balloons()
                     st.session_state.balloons_shown = True
                 
@@ -3909,16 +3938,10 @@ def validate_facility_csv_file(csv_file):
     file_read_time = time.time() - file_read_start
     timing_info.append(f"ファイル読み込み: {file_read_time:.3f}秒")
     
-    # chardetによるエンコーディング検出（処理時間短縮のため一時的にコメントアウト）
-    # detected_enc, confidence = detect_encoding(file_content)
-    # debug_info.append(f"chardetが検出したエンコーディング: {detected_enc} (信頼度: {confidence:.2f})")
-    
-    # 試行するエンコーディングの順序を決定（固定順序で高速化）
-    # encodings = [detected_enc] if detected_enc else []
-    # encodings.extend(['utf-8', 'shift-jis', 'cp932', 'euc-jp'])
-    # encodings = list(dict.fromkeys(encodings))
-    encodings = ['utf-8-sig', 'utf-8', 'shift-jis', 'cp932', 'euc-jp']
-    debug_info.append("エンコーディング検出をスキップし、固定順序で試行します（UTF-8 BOM対応）")
+    # 高速エンコーディング検出（最も一般的なものを優先）
+    encodings = ['utf-8-sig', 'utf-8']  # まずUTF-8系を試行
+    japanese_encodings = ['shift-jis', 'cp932', 'euc-jp']  # 日本語エンコーディングは必要時のみ
+    debug_info.append("高速化のため、UTF-8系を優先して試行します")
     
     encoding_start = time.time()
     successful_encoding = None
@@ -4173,7 +4196,7 @@ def show_sidebar_footer():
     
     # バージョン情報（控えめに表示）
     st.sidebar.markdown("---")
-    st.sidebar.caption("v2.4 - 2025/07/16")
+    st.sidebar.caption("v2.5 - 2025/07/23")
 
 def setup_page_config():
     """ページの基本設定を行う"""
