@@ -127,4 +127,4 @@ python test_session_management.py
 
 ## バージョン
 
-v1.1 - 2025/01/25 
+v2.5 - 2025/07/23 
