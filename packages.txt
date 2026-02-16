@@ -1,2 +1,0 @@
-# System packages required for the application
-# This file is used by Streamlit Cloud for system-level dependencies
